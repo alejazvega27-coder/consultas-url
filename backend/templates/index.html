@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Buscador de Cotizaciones</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
+<body>
+  <div class="contenedor">
+    <h1>Buscador de Cotizaciones</h1>
+
+    <div class="barra-busqueda">
+      <input type="text" id="input-busqueda" placeholder="Ej: dnit, cotizaciones, dolar...">
+      <button id="boton-buscar">Buscar</button>
+    </div>
+
+    <p id="estado"></p>
+
+    <div class="tabla-contenedor">
+      <table id="tabla-resultados">
+        <thead><tr id="encabezado"></tr></thead>
+        <tbody id="cuerpo"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
