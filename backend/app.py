@@ -1,67 +1,53 @@
 """
-Backend Flask.
-
-Requisitos:
-    pip install flask requests beautifulsoup4 pandas lxml
-
-Uso:
-    cd backend
-    python app.py
-    # abrir http://localhost:5000
+Aplicación principal de Streamlit para el buscador DNIT.
+Ejecución: streamlit run app.py
 """
 
-import pandas as pd
-import requests
-from flask import Flask, jsonify, render_template, request
+import streamlit as st
+from scraper import ejecutar_busqueda
 
-from backend.scraper import FUENTES, ejecutar_busqueda
+# 1. Configuración de la página en modo ancho 
+# (Debe ser obligatoriamente la primera línea de Streamlit)
+st.set_page_config(layout="wide", page_title="Buscador DNIT")
 
-app = Flask(__name__)
+# Interfaz visual
+st.title("Buscador General")
+st.markdown("Sistema de consulta y filtrado de datos institucionales")
 
+# Campo de búsqueda
+termino = st.text_input("Buscar...", "decreto")
 
-@app.route("/")
-def index():
-    return render_template(
-        "index.html"
-    )  # Esto buscará automáticamente en backend/templates/
-
-
-@app.route("/api/fuentes")
-def listar_fuentes():
-    """Devuelve las fuentes disponibles, util para mostrar sugerencias en el frontend."""
-    return jsonify([
-        {"id": f["id"], "nombre": f["nombre"], "alias": f["alias"]}
-        for f in FUENTES
-    ])
-
-
-@app.route("/api/buscar")
-def buscar():
-    termino = request.args.get("q", "").strip()
-    if not termino:
-        return jsonify({"error": "Falta el parametro 'q'"}), 400
-
-    try:
-        fuente, df = ejecutar_busqueda(termino)
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 404
-    except requests.exceptions.RequestException as exc:
-        return jsonify({"error": f"No se pudo descargar la pagina: {exc}"}), 502
-    except Exception as exc:  # noqa: BLE001 - devolvemos cualquier error al frontend
-        return jsonify({"error": f"Error inesperado: {exc}"}), 500
-
-    info_fuente = {"id": fuente["id"], "nombre": fuente["nombre"], "url": fuente["url"]}
-
-    if df.empty:
-        return jsonify({"fuente": info_fuente, "columnas": [], "filas": []})
-
-    df_limpio = df.where(pd.notna(df), None)
-    return jsonify({
-        "fuente": info_fuente,
-        "columnas": df_limpio.columns.tolist(),
-        "filas": df_limpio.values.tolist(),
-    })
-
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+# Ejecutar búsqueda al presionar enter o cambiar el texto
+if termino:
+    with st.spinner("Procesando consulta y extrayendo datos..."):
+        fuente, df_resultado = ejecutar_busqueda(termino)
+    
+    st.caption(f"Fuente: {fuente['nombre']} ({len(df_resultado)} filas) - {fuente['url']}")
+    
+    if not df_resultado.empty:
+        # Validamos si es la fuente de decretos para aplicar el formato avanzado de columnas y enlaces
+        if fuente["id"] == "dnit_ruc":
+            st.dataframe(
+                df_resultado,
+                use_container_width=True,  # Ocupa todo el ancho de la pantalla
+                column_config={
+                    "Título": st.column_config.TextColumn("Título", width="medium"),
+                    "Descripción": st.column_config.TextColumn(
+                        "Descripción", 
+                        width="large"  # Amplía el espacio visual para leer mejor los textos largos
+                    ),
+                    "Enlace Descargar": st.column_config.LinkColumn(
+                        "Enlace Descargar",
+                        display_text="📥 Descargar PDF"  # Transforma la URL en un botón interactivo y limpio
+                    ),
+                    "Enlace Ver": st.column_config.LinkColumn(
+                        "Enlace Ver",
+                        display_text="🌐 Ver Detalle"   # Transforma la URL en un botón interactivo y limpio
+                    )
+                }
+            )
+        else:
+            # Para otras fuentes de datos (ej. Cotizaciones)
+            st.dataframe(df_resultado, use_container_width=True)
+    else:
+        st.warning("No se encontraron resultados para la búsqueda ingresada.")
