@@ -27,6 +27,9 @@ LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download
 
 # ---------------------------------------------------------------------------
 # MAPA DE NAVEGACION
+# "fuente": id de la fuente en scraper.FUENTES (None = todavía no configurada)
+# "prefijo": filtra los títulos que empiezan con ese texto (ej. solo "Ley ...")
+# Para habilitar un botón nuevo basta con completar su "fuente" (y "prefijo").
 # ---------------------------------------------------------------------------
 NAVEGACION = {
     "Normativa Impositiva": {
@@ -37,14 +40,6 @@ NAVEGACION = {
             "Decretos":     {"icono": "📜", "fuente": "dnit_decretos_imp",     "prefijo": None},
             "Resoluciones": {"icono": "📑", "fuente": "dnit_resoluciones_imp", "prefijo": None},
             "Digesto":      {"icono": "📚", "fuente": "digesto_tributario",    "prefijo": None},
-            # Biblioteca impositiva integrada de forma directa
-            "IVA":          {"icono": "📖", "fuente": "dnit_biblioteca_iva",   "prefijo": None},
-            "IRP":          {"icono": "📖", "fuente": "dnit_biblioteca_irp",   "prefijo": None},
-            "IRE":          {"icono": "📖", "fuente": "dnit_biblioteca_ire",   "prefijo": None},
-            "IDU":          {"icono": "📖", "fuente": "dnit_biblioteca_idu",   "prefijo": None},
-            "INR":          {"icono": "📖", "fuente": "dnit_biblioteca_inr",   "prefijo": None},
-            "ISC":          {"icono": "📖", "fuente": "dnit_biblioteca_isc",   "prefijo": None},
-            "IRE RESIMPLE": {"icono": "📖", "fuente": "dnit_biblioteca_ire_resimple", "prefijo": None},
         },
     },
     "Normativa Aduanera": {
@@ -89,6 +84,14 @@ st.session_state.setdefault("tipo", None)
 def ir_a(seccion: str, tipo: str):
     st.session_state.seccion = seccion
     st.session_state.tipo = tipo
+
+
+def ir_a_biblioteca(cat: dict):
+    """Logos de Biblioteca Impositiva: van directo a la tabla de ese impuesto,
+    sin pasar por una pantalla intermedia."""
+    st.session_state.seccion = "Normativa Impositiva"
+    st.session_state.tipo = f"Biblioteca · {cat['nombre']}"
+    st.session_state.biblioteca_cat = cat
 
 
 def volver_inicio():
@@ -188,11 +191,53 @@ def obtener_df(item: dict, filtro: str):
     return filtrar_df(df, filtro)
 
 
+def _elegir_biblioteca(clave_sub: str, nombre: str):
+    st.session_state[clave_sub] = nombre
+
+
+def _volver_biblioteca(clave_sub: str):
+    st.session_state[clave_sub] = None
+
+
 def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
                     con_titulo: bool = True, clave: str = "sec"):
-    """Muestra un par sección/tipo: filtro propio + tabla (o aviso 'próximamente')."""
+    """Muestra un par sección/tipo: filtro propio + tabla (o aviso 'próximamente').
+    filtro_base = texto que ya venía del buscador general.
+    Si el item tiene 'subitems' (ej. Biblioteca), primero se elige uno con
+    botones de logo y recién después se muestra su tabla."""
     if con_titulo:
         st.markdown(f"##### {item['icono']} {tipo}")
+
+    subitems = item.get("subitems")
+    if subitems:
+        clave_sub = f"biblio_{clave}_{seccion}_{tipo}"
+        st.session_state.setdefault(clave_sub, None)
+        elegido = st.session_state[clave_sub]
+
+        if elegido is None:
+            st.caption("Elegí un impuesto para ver sus normativas y guías.")
+            columnas = st.columns(4)
+            for i, cat in enumerate(subitems):
+                with columnas[i % 4]:
+                    st.image(cat["logo"], width=120)
+                    st.button(
+                        cat["nombre"],
+                        key=f"{clave_sub}_{cat['nombre']}",
+                        on_click=_elegir_biblioteca,
+                        args=(clave_sub, cat["nombre"]),
+                        width="stretch",
+                    )
+            return
+
+        cat = next(c for c in subitems if c["nombre"] == elegido)
+        st.button(
+            "← Volver a Biblioteca",
+            key=f"{clave_sub}_volver",
+            on_click=_volver_biblioteca,
+            args=(clave_sub,),
+        )
+        tipo = f"Biblioteca · {elegido}"
+        item = {"icono": item["icono"], "fuente": cat["fuente"], "prefijo": None}
 
     if item["fuente"] is None:
         st.info(f"**{tipo}** de **{seccion}** todavía no tiene una fuente configurada (próximamente).")
@@ -222,8 +267,7 @@ ALIAS_TIPO = {
     "decreto": "Decretos", "decretos": "Decretos",
     "resolucion": "Resoluciones", "resoluciones": "Resoluciones",
     "digesto": "Digesto", "digestos": "Digesto", "digesta": "Digesto", "digestas": "Digesto",
-    "iva": "IVA", "irp": "IRP", "ire": "IRE", "idu": "IDU",
-    "inr": "INR", "isc": "ISC", "resimple": "IRE RESIMPLE",
+    "biblioteca": "Biblioteca", "bibliotecas": "Biblioteca",
 }
 ALIAS_SECCION = {
     "impositiva": "Normativa Impositiva", "impositivo": "Normativa Impositiva",
@@ -241,11 +285,13 @@ ALIAS_TODOS = {
 }
 PALABRAS_RELLENO = {"de", "del", "la", "el", "los", "las", "en", "y", "dnit",
                     "legislativo", "norma", "normas", "normativa"}
-MIN_PREFIJO = 3
-MIN_TIPEO = 4
+MIN_PREFIJO = 3   # "dec" ya alcanza para decretos
+MIN_TIPEO = 4     # "desreto" se corrige a decreto
 
 
 def reconocer(palabra: str):
+    """Devuelve ('tipo'|'seccion', valor) o None.
+    Acepta la palabra completa, un prefijo ("dec", "res", "adu") o un error leve de tipeo."""
     if palabra in ALIAS_TODOS:
         return ALIAS_TODOS[palabra]
 
@@ -254,7 +300,7 @@ def reconocer(palabra: str):
         if len(candidatos) == 1:
             return candidatos.pop()
         if len(candidatos) > 1:
-            return None
+            return None  # prefijo ambiguo: se trata como texto a filtrar
 
     if len(palabra) >= MIN_TIPEO:
         parecidos = difflib.get_close_matches(palabra, ALIAS_TODOS.keys(), n=1, cutoff=0.8)
@@ -264,6 +310,7 @@ def reconocer(palabra: str):
 
 
 def interpretar(termino: str):
+    """Separa lo escrito en: secciones, tipos y el resto (texto a filtrar)."""
     secciones, tipos, resto = [], [], []
     for original in termino.lower().split():
         norm = normalizar(original)
@@ -282,12 +329,13 @@ def interpretar(termino: str):
 
 
 def destinos(secciones: list, tipos: list):
+    """Pares (sección, tipo, item) de NAVEGACION que corresponden a lo buscado."""
     salida = []
     for seccion, datos in NAVEGACION.items():
         if secciones and seccion not in secciones:
             continue
         if seccion == "Cotizaciones" and seccion not in secciones:
-            continue
+            continue  # Cotizaciones solo aparece si se la nombra
         for tipo, item in datos["items"].items():
             if tipos and seccion != "Cotizaciones" and tipo not in tipos:
                 continue
@@ -334,7 +382,10 @@ termino = st.text_input(
 )
 
 # ---------------------------------------------------------------------------
-# 1) BUSQUEDA GENERAL
+# 1) BUSQUEDA GENERAL: tiene prioridad sobre la navegación
+#    - Si reconoce sección y/o tipo (ej. "decreto", "ley aduanera") busca en
+#      todas las secciones que correspondan, una pestaña por sección.
+#    - Si no reconoce ninguno, se comporta como antes (detecta una fuente).
 # ---------------------------------------------------------------------------
 if termino.strip():
     secciones, tipos, resto = interpretar(termino)
@@ -377,7 +428,7 @@ if termino.strip():
         mostrar_tabla(df_resultado, fuente, clave="tabla_busq_general")
 
 # ---------------------------------------------------------------------------
-# 2) VISTA DE SECCION
+# 2) VISTA DE SECCION (ej. Normativa Impositiva > Decretos)
 # ---------------------------------------------------------------------------
 elif st.session_state.seccion:
     seccion, tipo = st.session_state.seccion, st.session_state.tipo
@@ -393,67 +444,27 @@ elif st.session_state.seccion:
 else:
     col_imp, col_adu = st.columns(2, gap="large")
 
-    # Columna de Normativa Impositiva
-    with col_imp, st.container(border=True):
-        datos = NAVEGACION["Normativa Impositiva"]
-        st.markdown(
-            f"<p class='tarjeta-titulo'>{datos['icono']} Normativa Impositiva</p>"
-            f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
-            unsafe_allow_html=True,
-        )
-        
-        # Botones principales (Leyes, Decretos, Resoluciones, Digesto)
-        principales = ["Leyes", "Decretos", "Resoluciones", "Digesto"]
-        botones = st.columns(2)
-        for i, tipo in enumerate(principales):
-            item = datos["items"][tipo]
-            etiqueta = f"{item['icono']} {tipo}"
-            botones[i % 2].button(
-                etiqueta,
-                key=f"btn_Normativa Impositiva_{tipo}",
-                on_click=ir_a,
-                args=("Normativa Impositiva", tipo),
-                width="stretch",
+    for columna, nombre in ((col_imp, "Normativa Impositiva"), (col_adu, "Normativa Aduanera")):
+        datos = NAVEGACION[nombre]
+        with columna, st.container(border=True):
+            st.markdown(
+                f"<p class='tarjeta-titulo'>{datos['icono']} {nombre}</p>"
+                f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
+                unsafe_allow_html=True,
             )
-        
-        # Biblioteca de impuestos desplegada directamente con sus logos
-        st.markdown("---")
-        st.markdown("##### 📖 Biblioteca de Normativas por Impuesto")
-        impuestos_biblio = ["IVA", "IRP", "IRE", "IDU", "INR", "ISC", "IRE RESIMPLE"]
-        cols_biblio = st.columns(4)
-        for idx, tipo in enumerate(impuestos_biblio):
-            cat = next((c for c in BIBLIOTECA_IMPOSITIVA if c["nombre"] == tipo), None)
-            with cols_biblio[idx % 4]:
-                if cat and "logo" in cat:
-                    st.image(cat["logo"], width=100)
-                st.button(
-                    tipo,
-                    key=f"btn_biblio_Normativa Impositiva_{tipo}",
+            botones = st.columns(2)
+            for i, (tipo, item) in enumerate(datos["items"].items()):
+                etiqueta = f"{item['icono']} {tipo}"
+                if item["fuente"] is None and not item.get("subitems"):
+                    etiqueta += " (próximamente)"
+                botones[i % 2].button(
+                    etiqueta,
+                    key=f"btn_{nombre}_{tipo}",
                     on_click=ir_a,
-                    args=("Normativa Impositiva", tipo),
+                    args=(nombre, tipo),
                     width="stretch",
                 )
 
-    # Columna de Normativa Aduanera
-    with col_adu, st.container(border=True):
-        datos = NAVEGACION["Normativa Aduanera"]
-        st.markdown(
-            f"<p class='tarjeta-titulo'>{datos['icono']} Normativa Aduanera</p>"
-            f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
-            unsafe_allow_html=True,
-        )
-        botones = st.columns(2)
-        for i, (tipo, item) in enumerate(datos["items"].items()):
-            etiqueta = f"{item['icono']} {tipo}"
-            botones[i % 2].button(
-                etiqueta,
-                key=f"btn_Normativa Aduanera_{tipo}",
-                on_click=ir_a,
-                args=("Normativa Aduanera", tipo),
-                width="stretch",
-            )
-
-    # Tarjeta de Cotizaciones
     datos = NAVEGACION["Cotizaciones"]
     with st.container(border=True):
         st.markdown(
