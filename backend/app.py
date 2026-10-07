@@ -31,6 +31,16 @@ LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download
 # "prefijo": filtra los títulos que empiezan con ese texto (ej. solo "Ley ...")
 # Para habilitar un botón nuevo basta con completar su "fuente" (y "prefijo").
 # ---------------------------------------------------------------------------
+# Un item por impuesto de la Biblioteca (IVA, IRP, IRE...), armado a partir de
+# scraper.BIBLIOTECA_IMPOSITIVA. La clave "logo" es lo que distingue a estos
+# botones de los demás: la pantalla de inicio los dibuja con su logo, en una
+# fila propia, automáticamente debajo de Leyes/Decretos/Resoluciones/Digesto
+# (sin un botón "Biblioteca" ni pantalla intermedia).
+ITEMS_BIBLIOTECA_IMP = {
+    cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"]}
+    for cat in BIBLIOTECA_IMPOSITIVA
+}
+
 NAVEGACION = {
     "Normativa Impositiva": {
         "icono": "🧾",
@@ -40,6 +50,7 @@ NAVEGACION = {
             "Decretos":     {"icono": "📜", "fuente": "dnit_decretos_imp",     "prefijo": None},
             "Resoluciones": {"icono": "📑", "fuente": "dnit_resoluciones_imp", "prefijo": None},
             "Digesto":      {"icono": "📚", "fuente": "digesto_tributario",    "prefijo": None},
+            **ITEMS_BIBLIOTECA_IMP,
         },
     },
     "Normativa Aduanera": {
@@ -84,14 +95,6 @@ st.session_state.setdefault("tipo", None)
 def ir_a(seccion: str, tipo: str):
     st.session_state.seccion = seccion
     st.session_state.tipo = tipo
-
-
-def ir_a_biblioteca(cat: dict):
-    """Logos de Biblioteca Impositiva: van directo a la tabla de ese impuesto,
-    sin pasar por una pantalla intermedia."""
-    st.session_state.seccion = "Normativa Impositiva"
-    st.session_state.tipo = f"Biblioteca · {cat['nombre']}"
-    st.session_state.biblioteca_cat = cat
 
 
 def volver_inicio():
@@ -191,53 +194,12 @@ def obtener_df(item: dict, filtro: str):
     return filtrar_df(df, filtro)
 
 
-def _elegir_biblioteca(clave_sub: str, nombre: str):
-    st.session_state[clave_sub] = nombre
-
-
-def _volver_biblioteca(clave_sub: str):
-    st.session_state[clave_sub] = None
-
-
 def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
                     con_titulo: bool = True, clave: str = "sec"):
     """Muestra un par sección/tipo: filtro propio + tabla (o aviso 'próximamente').
-    filtro_base = texto que ya venía del buscador general.
-    Si el item tiene 'subitems' (ej. Biblioteca), primero se elige uno con
-    botones de logo y recién después se muestra su tabla."""
+    filtro_base = texto que ya venía del buscador general."""
     if con_titulo:
         st.markdown(f"##### {item['icono']} {tipo}")
-
-    subitems = item.get("subitems")
-    if subitems:
-        clave_sub = f"biblio_{clave}_{seccion}_{tipo}"
-        st.session_state.setdefault(clave_sub, None)
-        elegido = st.session_state[clave_sub]
-
-        if elegido is None:
-            st.caption("Elegí un impuesto para ver sus normativas y guías.")
-            columnas = st.columns(4)
-            for i, cat in enumerate(subitems):
-                with columnas[i % 4]:
-                    st.image(cat["logo"], width=120)
-                    st.button(
-                        cat["nombre"],
-                        key=f"{clave_sub}_{cat['nombre']}",
-                        on_click=_elegir_biblioteca,
-                        args=(clave_sub, cat["nombre"]),
-                        width="stretch",
-                    )
-            return
-
-        cat = next(c for c in subitems if c["nombre"] == elegido)
-        st.button(
-            "← Volver a Biblioteca",
-            key=f"{clave_sub}_volver",
-            on_click=_volver_biblioteca,
-            args=(clave_sub,),
-        )
-        tipo = f"Biblioteca · {elegido}"
-        item = {"icono": item["icono"], "fuente": cat["fuente"], "prefijo": None}
 
     if item["fuente"] is None:
         st.info(f"**{tipo}** de **{seccion}** todavía no tiene una fuente configurada (próximamente).")
@@ -267,7 +229,10 @@ ALIAS_TIPO = {
     "decreto": "Decretos", "decretos": "Decretos",
     "resolucion": "Resoluciones", "resoluciones": "Resoluciones",
     "digesto": "Digesto", "digestos": "Digesto", "digesta": "Digesto", "digestas": "Digesto",
-    "biblioteca": "Biblioteca", "bibliotecas": "Biblioteca",
+    "iva": "IVA", "irp": "IRP", "ire": "IRE", "idu": "IDU", "inr": "INR", "isc": "ISC",
+    "iresimple": "IRE RESIMPLE",
+    # "resimple" (sin la "i") no se usa como alias: comparte el prefijo "res" con
+    # Resoluciones y rompería ese atajo ("res" quedaría ambiguo).
 }
 ALIAS_SECCION = {
     "impositiva": "Normativa Impositiva", "impositivo": "Normativa Impositiva",
@@ -452,10 +417,13 @@ else:
                 f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
                 unsafe_allow_html=True,
             )
+            items_normales = {t: i for t, i in datos["items"].items() if "logo" not in i}
+            items_biblioteca = {t: i for t, i in datos["items"].items() if "logo" in i}
+
             botones = st.columns(2)
-            for i, (tipo, item) in enumerate(datos["items"].items()):
+            for i, (tipo, item) in enumerate(items_normales.items()):
                 etiqueta = f"{item['icono']} {tipo}"
-                if item["fuente"] is None and not item.get("subitems"):
+                if item["fuente"] is None:
                     etiqueta += " (próximamente)"
                 botones[i % 2].button(
                     etiqueta,
@@ -464,6 +432,20 @@ else:
                     args=(nombre, tipo),
                     width="stretch",
                 )
+
+            if items_biblioteca:
+                st.caption("Biblioteca por impuesto")
+                columnas_logo = st.columns(4)
+                for i, (tipo, item) in enumerate(items_biblioteca.items()):
+                    with columnas_logo[i % 4]:
+                        st.image(item["logo"], width=90)
+                        st.button(
+                            tipo,
+                            key=f"btn_{nombre}_{tipo}",
+                            on_click=ir_a,
+                            args=(nombre, tipo),
+                            width="stretch",
+                        )
 
     datos = NAVEGACION["Cotizaciones"]
     with st.container(border=True):
