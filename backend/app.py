@@ -16,6 +16,14 @@ import streamlit as st
 from scraper import descargar_archivo, ejecutar_busqueda, nombre_archivo, obtener_fuente
 
 st.set_page_config(layout="wide", page_title="Buscador DNIT")
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    .stDeployButton {display:none;}
+    </style>
+"""
 
 LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download=true"
 
