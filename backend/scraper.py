@@ -91,6 +91,34 @@ def _tipo_enlace(a) -> str:
     return texto if texto in ("descargar", "ver") else ""
 
 
+def _recolectar_registro(titulo_tag, tags_corte: tuple, url_base: str):
+    """Desde un tag de titulo, junta el texto (descripcion) y clasifica los
+    enlaces 'Descargar'/'Ver' que le siguen, hasta el proximo tag cuyo nombre
+    este en tags_corte (el siguiente registro, seccion o el pie de pagina)."""
+    partes, link_descargar, link_ver, vio_enlace = [], "", "", False
+    for el in titulo_tag.next_elements:
+        if any(padre is titulo_tag for padre in el.parents):
+            continue  # texto del propio titulo
+        if isinstance(el, Tag):
+            if el.name in tags_corte:
+                break
+            if el.name == "a":
+                vio_enlace = True
+                tipo = _tipo_enlace(el)
+                href = (el.get("href") or "").strip()
+                if tipo and href and not href.startswith(("#", "javascript")):
+                    enlace = urljoin(url_base, href)
+                    if tipo == "descargar" and not link_descargar:
+                        link_descargar = enlace
+                    elif tipo == "ver" and not link_ver:
+                        link_ver = enlace
+        elif type(el) is NavigableString and not vio_enlace and el.find_parent("a") is None:
+            texto = " ".join(str(el).split())
+            if texto:
+                partes.append(texto)
+    return " ".join(partes), link_descargar, link_ver
+
+
 def parser_dnit_normativa(html: str, url_base: str = "https://www.dnit.gov.py",
                           max_chars: int = None) -> pd.DataFrame:
     """Parser unico para las paginas de normativas de dnit.gov.py
@@ -114,32 +142,12 @@ def parser_dnit_normativa(html: str, url_base: str = "https://www.dnit.gov.py",
         if not titulo or _RE_TITULO_GENERAL.match(titulo):
             continue
 
-        partes, link_descargar, link_ver, vio_enlace = [], "", "", False
-        for el in encabezado.next_elements:
-            if any(padre is encabezado for padre in el.parents):
-                continue  # texto del propio titulo
-            if isinstance(el, Tag):
-                if el.name in ("h1", "h2", "h3", "h4", "footer"):
-                    break
-                if el.name == "a":
-                    vio_enlace = True
-                    tipo = _tipo_enlace(el)
-                    href = (el.get("href") or "").strip()
-                    if tipo and href and not href.startswith(("#", "javascript")):
-                        enlace = urljoin(url_base, href)
-                        if tipo == "descargar" and not link_descargar:
-                            link_descargar = enlace
-                        elif tipo == "ver" and not link_ver:
-                            link_ver = enlace
-            elif type(el) is NavigableString and not vio_enlace and el.find_parent("a") is None:
-                texto = " ".join(str(el).split())
-                if texto:
-                    partes.append(texto)
-
+        descripcion, link_descargar, link_ver = _recolectar_registro(
+            encabezado, ("h1", "h2", "h3", "h4", "footer"), url_base
+        )
         if not (link_descargar or link_ver):
             continue  # no es un registro de normativa
 
-        descripcion = " ".join(partes)
         if max_chars and len(descripcion) > max_chars:
             descripcion = descripcion[:max_chars].strip() + "..."
 
@@ -160,6 +168,86 @@ def parser_dnit_normativa(html: str, url_base: str = "https://www.dnit.gov.py",
 
 # Compatibilidad: el nombre anterior sigue funcionando
 parser_dnit_decretos = parser_dnit_normativa
+
+# ---------------------------------------------------------------------------
+# BIBLIOTECA IMPOSITIVA (paginas por impuesto: IVA, IRP, IRE, IDU, INR, ISC, IRE RESIMPLE)
+# ---------------------------------------------------------------------------
+
+SECCIONES_BIBLIOTECA = ("Normativas", "Guías")
+_RE_FECHA_BIBLIOTECA = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+
+
+def _fecha_antes_de(titulo_tag) -> str:
+    """Busca hacia atras el primer texto suelto (ej. '01-01-1991') que suele
+    anteceder al titulo de cada norma/guia en las paginas de Biblioteca."""
+    for el in titulo_tag.previous_elements:
+        if isinstance(el, Tag) and el.name in ("h1", "h2", "h3", "h4", "h5", "h6", "a"):
+            return ""
+        if type(el) is NavigableString:
+            texto = str(el).strip()
+            if texto:
+                return texto if _RE_FECHA_BIBLIOTECA.match(texto) else ""
+    return ""
+
+
+def parser_biblioteca_categoria(html: str, url_base: str = "https://www.dnit.gov.py",
+                                max_chars: int = None) -> pd.DataFrame:
+    """Parser de una categoria de la Biblioteca Impositiva (paginas /iva, /irp,
+    /ire, /idu, /inr, /isc, /ire-resimple).
+
+    Cada una de esas paginas trae varias secciones; se usan las dos que listan
+    un documento por registro con su propio titulo y descripcion: 'Normativas'
+    (leyes, decretos, resoluciones de ese impuesto) y 'Guías' (guias paso a
+    paso). El resto de la pagina (accesos rapidos, noticias, videos) no sigue
+    ese mismo patron registro por registro y se deja fuera.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    filas = []
+
+    for etiqueta in SECCIONES_BIBLIOTECA:
+        encabezado_seccion = soup.find(
+            lambda t: t.name in ("h1", "h2", "h3") and t.get_text(strip=True).lower() == etiqueta.lower()
+        )
+        if encabezado_seccion is None:
+            continue
+        limite = encabezado_seccion.find_next(["h1", "h2", "h3"])
+
+        titulos = []
+        for el in encabezado_seccion.next_elements:
+            if limite is not None and el is limite:
+                break
+            if isinstance(el, Tag) and el.name in ("h4", "h5", "h6"):
+                titulos.append(el)
+
+        for titulo_tag in titulos:
+            titulo = " ".join(titulo_tag.get_text(" ", strip=True).split())
+            if not titulo:
+                continue
+
+            descripcion, link_descargar, link_ver = _recolectar_registro(
+                titulo_tag, ("h1", "h2", "h3", "h4", "h5", "h6", "footer"), url_base
+            )
+            if not (link_descargar or link_ver):
+                continue
+
+            if max_chars and len(descripcion) > max_chars:
+                descripcion = descripcion[:max_chars].strip() + "..."
+
+            filas.append({
+                "Sección": etiqueta,
+                "Fecha": _fecha_antes_de(titulo_tag),
+                "Título": titulo,
+                "Descripción": descripcion,
+                "Enlace Descargar": link_descargar,
+                "Enlace Ver": link_ver,
+            })
+
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        df = df.drop_duplicates(
+            subset=["Título", "Enlace Descargar", "Enlace Ver"]
+        ).reset_index(drop=True)
+    return df
 
 def _limpiar_numero(texto: str):
     texto = (texto or "").strip()
@@ -334,6 +422,81 @@ FUENTES = [
         "categoria": "aduanera",
         "parser": parser_digesto,
     },
+    {
+        "id": "dnit_biblioteca_iva",
+        "nombre": "DNIT - Biblioteca IVA",
+        "alias": ["iva"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/iva",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_irp",
+        "nombre": "DNIT - Biblioteca IRP",
+        "alias": ["irp"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/irp",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_ire",
+        "nombre": "DNIT - Biblioteca IRE",
+        "alias": ["ire"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/ire",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_idu",
+        "nombre": "DNIT - Biblioteca IDU",
+        "alias": ["idu"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/idu",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_inr",
+        "nombre": "DNIT - Biblioteca INR",
+        "alias": ["inr"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/inr",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_isc",
+        "nombre": "DNIT - Biblioteca ISC",
+        "alias": ["isc"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/isc",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_ire_resimple",
+        "nombre": "DNIT - Biblioteca IRE RESIMPLE",
+        "alias": ["ire resimple", "resimple"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/ire-resimple",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+]
+
+# Botones con logo para la pantalla de Biblioteca (ver NAVEGACION en app.py).
+# "logo" son los iconos oficiales que usa la propia pagina del DNIT.
+BIBLIOTECA_IMPOSITIVA = [
+    {"nombre": "IVA", "fuente": "dnit_biblioteca_iva",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-iva.svg/b5ec899c-8bcd-28fa-5498-b33b11db275e?t=1678484263694"},
+    {"nombre": "IRP", "fuente": "dnit_biblioteca_irp",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-irp.svg/bad8c8e3-9a57-e079-4bfe-e7638a4e32f6?t=1678484263863"},
+    {"nombre": "IRE", "fuente": "dnit_biblioteca_ire",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-ire.svg/54b7b93d-a677-3a4b-42d2-432ec08e5735?t=1678484263808"},
+    {"nombre": "IDU", "fuente": "dnit_biblioteca_idu",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/logo-idu+%281%29.svg/f9143016-5782-cc0f-a947-dd8276f97742?t=1678825637846"},
+    {"nombre": "INR", "fuente": "dnit_biblioteca_inr",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-inr.svg/86eb7c2e-0a8c-40a5-9ec1-9405c369b6fe?t=1678484263567"},
+    {"nombre": "ISC", "fuente": "dnit_biblioteca_isc",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-isc.svg/eac5b04c-5626-99d6-9b3a-f525321019d2?t=1678484263637"},
+    {"nombre": "IRE RESIMPLE", "fuente": "dnit_biblioteca_ire_resimple",
+     "logo": "https://www.dnit.gov.py/documents/20123/251762/logo-ire-simple.svg/d60f9112-3c2c-cef7-bdd0-18742b3c3cce?t=1683762469002"},
 ]
 
 
