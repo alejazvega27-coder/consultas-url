@@ -5,10 +5,12 @@ Reutilizada por app.py (backend/frontend).
 
 import difflib
 import re
-from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import unquote_plus, urljoin, urlparse
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
+import streamlit as st
 
 HEADERS = {
     "User-Agent": (
@@ -77,54 +79,87 @@ def parser_dnit(html: str) -> pd.DataFrame:
         df["fecha"] = df["fecha"].dt.strftime("%Y-%m-%d")
     return df
 
-def parser_dnit_decretos(html: str, url_base: str = "https://www.dnit.gov.py", max_chars: int = 300) -> pd.DataFrame:
-    """Parser optimizado que extrae URLs limpias y descripciones más amplias."""
-    soup = BeautifulSoup(html, "html.parser")
-    filas_totales = []
-    
-    bloques = soup.find_all('div', class_='resultado-item')
-    
-    if not bloques:
-        titulos = soup.find_all(['h3', 'h4'])
-        bloques = [t.find_parent('div') or t.parent for t in titulos]
+_RE_TITULO_GENERAL = re.compile(r"^\s*to(do|da)s\s+(los|las)\b", re.IGNORECASE)
 
-    for bloque in bloques:
-        if not bloque:
+
+def _tipo_enlace(a) -> str:
+    """Clasifica un <a> como 'descargar' o 'ver' (ignora los textos de los iconos)."""
+    texto = a.get_text(" ", strip=True).lower()
+    for icono in ("download", "visibility"):
+        texto = texto.replace(icono, "")
+    texto = texto.strip()
+    return texto if texto in ("descargar", "ver") else ""
+
+
+def parser_dnit_normativa(html: str, url_base: str = "https://www.dnit.gov.py",
+                          max_chars: int = None) -> pd.DataFrame:
+    """Parser unico para las paginas de normativas de dnit.gov.py
+    (leyes, decretos, resoluciones; impositivas y aduaneras).
+
+    Cada registro es un <h3> (titulo) seguido de una descripcion y de los enlaces
+    'Descargar' y/o 'Ver'. No depende de contenedores: recorre los elementos que
+    siguen a cada titulo hasta el proximo titulo, asi tolera registros sin
+    descripcion, sin 'Descargar' o con 'Ver' vacio.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    filas = []
+
+    # Si existe el titulo "Todas las ..." / "Todos los ...", los registros empiezan
+    # despues de el (evita leer titulos de la cabecera o del menu).
+    marcador = soup.find("h3", string=_RE_TITULO_GENERAL)
+    encabezados = marcador.find_all_next("h3") if marcador else soup.find_all("h3")
+
+    for encabezado in encabezados:
+        titulo = " ".join(encabezado.get_text(" ", strip=True).split())
+        if not titulo or _RE_TITULO_GENERAL.match(titulo):
             continue
-            
-        titulo_elem = bloque.find(['h3', 'h4', 'a'])
-        titulo = titulo_elem.get_text(strip=True) if titulo_elem else ""
-        
-        if not titulo or "Todos los decretos" in titulo:
-            continue
-            
-        desc_elem = bloque.find('p')
-        descripcion = desc_elem.get_text(strip=True) if desc_elem else ""
-        if len(descripcion) > max_chars:
+
+        partes, link_descargar, link_ver, vio_enlace = [], "", "", False
+        for el in encabezado.next_elements:
+            if any(padre is encabezado for padre in el.parents):
+                continue  # texto del propio titulo
+            if isinstance(el, Tag):
+                if el.name in ("h1", "h2", "h3", "h4", "footer"):
+                    break
+                if el.name == "a":
+                    vio_enlace = True
+                    tipo = _tipo_enlace(el)
+                    href = (el.get("href") or "").strip()
+                    if tipo and href and not href.startswith(("#", "javascript")):
+                        enlace = urljoin(url_base, href)
+                        if tipo == "descargar" and not link_descargar:
+                            link_descargar = enlace
+                        elif tipo == "ver" and not link_ver:
+                            link_ver = enlace
+            elif type(el) is NavigableString and not vio_enlace and el.find_parent("a") is None:
+                texto = " ".join(str(el).split())
+                if texto:
+                    partes.append(texto)
+
+        if not (link_descargar or link_ver):
+            continue  # no es un registro de normativa
+
+        descripcion = " ".join(partes)
+        if max_chars and len(descripcion) > max_chars:
             descripcion = descripcion[:max_chars].strip() + "..."
-        
-        link_descargar = ""
-        link_ver = ""
-        
-        for a in bloque.find_all('a', href=True):
-            texto_enlace = a.get_text(strip=True).lower()
-            href = a['href']
-            enlace_absoluto = urljoin(url_base, href)
-            
-            if "descargar" in texto_enlace:
-                link_descargar = enlace_absoluto
-            elif "ver" in texto_enlace:
-                link_ver = enlace_absoluto
-                
-        filas_totales.append({
+
+        filas.append({
             "Título": titulo,
             "Descripción": descripcion,
             "Enlace Descargar": link_descargar,
-            "Enlace Ver": link_ver
+            "Enlace Ver": link_ver,
         })
-        
-    df = pd.DataFrame(filas_totales)
+
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        df = df.drop_duplicates(
+            subset=["Título", "Enlace Descargar", "Enlace Ver"]
+        ).reset_index(drop=True)
     return df
+
+
+# Compatibilidad: el nombre anterior sigue funcionando
+parser_dnit_decretos = parser_dnit_normativa
 
 def _limpiar_numero(texto: str):
     texto = (texto or "").strip()
@@ -135,6 +170,81 @@ def _limpiar_numero(texto: str):
         return float(texto)
     except ValueError:
         return None
+
+URL_DIGESTO = "https://digestolegislativo.gov.py"
+_RE_ENCABEZADO = re.compile(r"^h[1-6]$")
+_RE_PROMULGACION = re.compile(r"Promulgaci[oó]n\W*([\d/\-]+)", re.IGNORECASE)
+_RE_SANCION = re.compile(r"Sanci[oó]n\W*([\d/\-]+)", re.IGNORECASE)
+_RE_SEPARAR_TITULO = re.compile(r"^(.+?\b\d{4})\.\s+(.*)$", re.DOTALL)
+
+
+def parser_digesto(html: str, url_base: str = URL_DIGESTO, max_chars: int = None) -> pd.DataFrame:
+    """Parser del Digesto Legislativo (tributario general y aduanero).
+
+    Cada norma tiene: un titulo linkeado (dentro de un encabezado) que apunta a
+    /detalles&id=..., las lineas 'Promulgacion' y 'Sancion', y los enlaces PDF/DOC.
+    Se recorren los elementos entre un titulo y el siguiente, asi no depende de
+    como esten agrupadas las normas en contenedores.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    titulos = [
+        a for a in soup.find_all("a", href=True)
+        if "detalles" in a["href"] and a.find_parent(_RE_ENCABEZADO)
+    ]
+    if not titulos:  # plan B: enlaces a detalles con texto largo
+        titulos = [
+            a for a in soup.find_all("a", href=True)
+            if "detalles" in a["href"] and len(a.get_text(strip=True)) > 40
+        ]
+    ids_titulo = {id(a) for a in titulos}
+
+    filas = []
+    for ancla in titulos:
+        texto_titulo = " ".join(ancla.get_text(" ", strip=True).split())
+        if not texto_titulo:
+            continue
+
+        textos, link_pdf = [], ""
+        for el in ancla.next_elements:
+            if any(padre is ancla for padre in el.parents):
+                continue  # contenido del propio titulo
+            if isinstance(el, Tag):
+                if el.name == "a":
+                    if id(el) in ids_titulo:
+                        break  # empieza la norma siguiente
+                    href = (el.get("href") or "").strip()
+                    nombre = el.get_text(strip=True).lower()
+                    if not link_pdf and href and (nombre == "pdf" or href.lower().replace(" ", "").endswith(".pdf")):
+                        link_pdf = urljoin(url_base, href.replace(" ", "%20"))
+            elif type(el) is NavigableString:
+                textos.append(str(el))
+
+        bloque = " ".join(" ".join(textos).split())
+        prom = _RE_PROMULGACION.search(bloque)
+        sanc = _RE_SANCION.search(bloque)
+
+        m = _RE_SEPARAR_TITULO.match(texto_titulo)
+        if m:
+            titulo, descripcion = m.group(1), m.group(2)
+        else:
+            titulo, _, descripcion = texto_titulo.partition(". ")
+        if max_chars and len(descripcion) > max_chars:
+            descripcion = descripcion[:max_chars].strip() + "..."
+
+        filas.append({
+            "Título": titulo.strip(),
+            "Descripción": descripcion.strip(),
+            "Promulgación": prom.group(1) if prom else "",
+            "Sanción": sanc.group(1) if sanc else "",
+            "Enlace Descargar": link_pdf,
+            "Enlace Ver": urljoin(url_base, ancla["href"].strip().replace(" ", "%20")),
+        })
+
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        df = df.drop_duplicates(subset="Enlace Ver").reset_index(drop=True)
+    return df
 
 
 def parser_generico(html: str) -> pd.DataFrame:
@@ -155,16 +265,81 @@ FUENTES = [
         "nombre": "DNIT - Historial de Cotizaciones",
         "alias": ["dnit", "cotizaciones", "dolar", "tipo de cambio", "divisas", "guaranies"],
         "url": "https://www.dnit.gov.py/web/portal-institucional/cotizaciones",
+        "categoria": "cotizaciones",
         "parser": parser_dnit,
     },
     {
-        "id": "dnit_ruc",
-        "nombre": "DNIT - Consulta RUC",
-        "alias": ["decreto tributario"],
+        "id": "dnit_leyes_imp",
+        "nombre": "DNIT - Leyes (Impositiva)",
+        "alias": ["leyes impositivas"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/leyes",
+        "categoria": "impositiva",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_decretos_imp",
+        "nombre": "DNIT - Decretos (Impositiva)",
+        "alias": ["decreto tributario", "decretos impositivos"],
         "url": "https://www.dnit.gov.py/web/portal-institucional/decretos",
-        "parser": parser_dnit_decretos,
+        "categoria": "impositiva",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_resoluciones_imp",
+        "nombre": "DNIT - Resoluciones (Impositiva)",
+        "alias": ["resoluciones impositivas"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/resoluciones",
+        "categoria": "impositiva",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_leyes_adu",
+        "nombre": "DNIT - Leyes (Aduanera)",
+        "alias": ["leyes aduaneras"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/leyes1",
+        "categoria": "aduanera",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_decretos_adu",
+        "nombre": "DNIT - Decretos (Aduanera)",
+        "alias": ["decretos aduaneros"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/decretos1",
+        "categoria": "aduanera",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_resoluciones_adu",
+        "nombre": "DNIT - Resoluciones (Aduanera)",
+        "alias": ["resoluciones aduaneras"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/resoluciones1",
+        "categoria": "aduanera",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "digesto_tributario",
+        "nombre": "Digesto Legislativo - Tributario en general",
+        "alias": ["digesto", "legislativo", "norma", "ley"],
+        "url": "https://digestolegislativo.gov.py/9-tributarios/308/91-tributario-en-general",
+        "url_datos": "https://digestolegislativo.gov.py/paginacion/interna.php?id=308&action=ajax&page={pagina}",
+        "categoria": "impositiva",
+        "parser": parser_digesto,
+    },
+    {
+        "id": "digesto_aduanero",
+        "nombre": "Digesto Legislativo - Aduanero",
+        "alias": ["digesto aduanero"],
+        "url": "https://digestolegislativo.gov.py/9-tributarios/309/92-aduanero",
+        "url_datos": "https://digestolegislativo.gov.py/paginacion/interna.php?id=309&action=ajax&page={pagina}",
+        "categoria": "aduanera",
+        "parser": parser_digesto,
     },
 ]
+
+
+def obtener_fuente(fuente_id: str):
+    """Devuelve la fuente registrada con ese id (o None)."""
+    return next((f for f in FUENTES if f["id"] == fuente_id), None)
 
 
 def buscar_fuente(termino: str, fuentes=FUENTES):
@@ -190,27 +365,117 @@ def buscar_fuente(termino: str, fuentes=FUENTES):
 
     return None
 
-
-def obtener_html(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=30)
+def obtener_html(url: str, extra_headers: dict = None) -> str:
+    headers = {**HEADERS, **(extra_headers or {})}
+    resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.text
 
 
-def ejecutar_busqueda(termino: str):
+def _tiene_normas(html: str) -> bool:
+    return "romulgaci" in html
+
+
+def _total_paginas(html: str) -> int:
+    """Lee el paginador de la primera pagina (ej. 1 2 3 4 5 ... 34) y devuelve el mayor."""
+    soup = BeautifulSoup(html, "html.parser")
+    numeros = [
+        int(a.get_text(strip=True)) for a in soup.find_all("a")
+        if a.get_text(strip=True).isdigit() and "javascript" in (a.get("href") or "")
+    ]
+    return max(numeros, default=1)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_html_paginado(url_plantilla: str, max_paginas: int = 100) -> str:
+    """Descarga page=1,2,3... del Digesto y devuelve todo el HTML junto.
+    Usa el paginador para bajar las paginas en paralelo y despues comprueba,
+    de forma secuencial, que no queden paginas mas alla de las anunciadas."""
+    extra = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://digestolegislativo.gov.py/",
+    }
+
+    def bajar(pagina):
+        try:
+            return obtener_html(url_plantilla.format(pagina=pagina), extra)
+        except requests.RequestException:
+            return ""
+
+    primera = obtener_html(url_plantilla.format(pagina=1), extra)
+    if not _tiene_normas(primera):
+        return primera
+
+    partes = [primera]
+    total = min(_total_paginas(primera), max_paginas)
+
+    if total > 1:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for html in pool.map(bajar, range(2, total + 1)):
+                if html and _tiene_normas(html):
+                    partes.append(html)
+
+    # por si el paginador no mostraba la ultima pagina
+    pagina = total + 1
+    while pagina <= max_paginas:
+        html = bajar(pagina)
+        if not html or not _tiene_normas(html) or html in partes:
+            break
+        partes.append(html)
+        pagina += 1
+
+    return "\n".join(partes)
+
+
+_RE_EXTENSION = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|csv|txt|zip|rar)$", re.IGNORECASE)
+_RE_CARACTERES_INVALIDOS = re.compile(r'[\\/:*?"<>|]+')
+
+
+def nombre_archivo(url: str, titulo: str = "archivo") -> str:
+    """Nombre de archivo para la descarga: el que viene en la URL; si no, el titulo + .pdf."""
+    ruta = unquote_plus(urlparse(url).path)
+    for segmento in reversed(ruta.split("/")):
+        if _RE_EXTENSION.search(segmento):
+            return _RE_CARACTERES_INVALIDOS.sub("_", segmento).strip()
+    base = _RE_CARACTERES_INVALIDOS.sub("_", titulo).strip() or "archivo"
+    return base[:120] + ".pdf"
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=30)
+def descargar_archivo(url: str):
+    """Baja el archivo desde el servidor de la app y devuelve (bytes, tipo_mime).
+    Asi se puede ofrecer con st.download_button y el navegador lo descarga
+    en lugar de abrirlo en una pestaña."""
+    extra = {"Referer": "https://digestolegislativo.gov.py/"} if "digestolegislativo" in url else None
+    headers = {**HEADERS, **(extra or {})}
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    tipo = resp.headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
+    if tipo == "text/html":
+        raise ValueError("El servidor devolvió una página web en lugar del archivo.")
+    return resp.content, tipo
+
+
+def ejecutar_busqueda(termino: str, fuente_id: str = None):
+    """Si se indica fuente_id se usa esa fuente (navegacion por secciones);
+    si no, se detecta la fuente a partir del termino (buscador general)."""
     termino_lower = termino.lower().strip()
-    fuente = buscar_fuente(termino)
-    
+    fuente = obtener_fuente(fuente_id) if fuente_id else buscar_fuente(termino)
+
     if fuente is None:
         fuente = FUENTES[0]
 
-    html = obtener_html(fuente["url"])
+    if "url_datos" in fuente:
+        html = obtener_html_paginado(fuente["url_datos"])
+    else:
+        html = obtener_html(fuente["url"])
     df = fuente["parser"](html)
 
     if df.empty or not termino_lower:
         return fuente, df
 
-    palabras_ignorar = {"dnit", "cotizaciones", "tipo", "de", "cambio", "divisas", "guaranies"}
+    palabras_ignorar = {"dnit", "cotizaciones", "tipo", "de", "cambio", "divisas", "guaranies",
+                        "digesto", "legislativo", "norma"}
     tokens = [t for t in termino_lower.split() if t not in palabras_ignorar]
 
     if not tokens:
