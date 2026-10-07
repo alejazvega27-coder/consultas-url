@@ -1,4 +1,9 @@
-   streamlit
-   requests
-   beautifulsoup4
-   pandas
+flask
+requests
+beautifulsoup4
+pandas
+#lxml
+streamlit
+requests
+beautifulsoup4
+pandas
