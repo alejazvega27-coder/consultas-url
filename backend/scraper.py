@@ -1,464 +1,775 @@
 """
-Aplicación principal de Streamlit para el buscador DNIT.
-Ejecución: streamlit run app.py
-
-Estructura:
-  - Buscador general (siempre arriba): detecta la fuente según lo escrito.
-  - Pantalla de inicio: Normativa Impositiva, Normativa Aduanera y Cotizaciones.
-  - Vista de sección: tabla de resultados + filtro propio de esa sección.
+Logica de scraping: registro de fuentes, parsers y busqueda.
+Reutilizada por app.py (backend/frontend).
 """
 
 import difflib
-import unicodedata
-import urllib.parse
-
+import re
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import unquote_plus, urljoin, urlparse
+import pandas as pd
 import requests
+from bs4 import BeautifulSoup, NavigableString, Tag
 import streamlit as st
-from scraper import (
-    BIBLIOTECA_IMPOSITIVA,
-    BIBLIOTECA_ADUANERA,
-    descargar_archivo,
-    ejecutar_busqueda,
-    nombre_archivo,
-    obtener_fuente,
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+
+# ---------------------------------------------------------------------------
+# PARSERS ESPECIFICOS POR SITIO
+# ---------------------------------------------------------------------------
+
+MONEDAS = ["DOLAR", "REAL", "PESO_ARG", "YEN", "EURO", "LIBRA"]
+SUBCOLUMNAS = ["Compra", "Venta"]
+MESES_ES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+}
+PATRON_TITULO_DNIT = re.compile(
+    r"Tipos de cambios del mes de\s+(\w+)\s+(\d{4})", re.IGNORECASE
 )
 
-st.set_page_config(layout="wide", page_title="Buscador DNIT")
+def parser_dnit(html: str) -> pd.DataFrame:
+    """Parser especifico para dnit.gov.py/.../cotizaciones"""
+    soup = BeautifulSoup(html, "html.parser")
+    filas_totales = []
 
-LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download=true"
+    for nodo_texto in soup.find_all(string=PATRON_TITULO_DNIT):
+        texto = nodo_texto.strip()
+        match = PATRON_TITULO_DNIT.search(texto)
+        mes_nombre, anio = match.group(1).lower(), int(match.group(2))
+        mes_num = MESES_ES.get(mes_nombre)
+        if mes_num is None:
+            continue
 
-# Sincronizar parámetros de URL para permitir clics directos en los iconos
-if "sec" in st.query_params:
-    st.session_state.seccion = st.query_params["sec"]
-if "tip" in st.query_params:
-    st.session_state.tipo = st.query_params["tip"]
+        tabla = nodo_texto.find_next("table")
+        if tabla is None:
+            continue
 
-# ---------------------------------------------------------------------------
-# MAPA DE NAVEGACION
-# ---------------------------------------------------------------------------
-ITEMS_BIBLIOTECA_IMP = {
-    cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"],"color": cat.get("color", "")}
-    for cat in BIBLIOTECA_IMPOSITIVA
-}
+        filas = tabla.find_all("tr")
+        for fila in filas[2:]:
+            celdas = [c.get_text(strip=True) for c in fila.find_all(["td", "th"])]
+            if not celdas or not celdas[0].isdigit():
+                continue
+            dia = int(celdas[0])
+            valores = celdas[1:13]
+            if len(valores) < 12:
+                continue
+            try:
+                fecha = pd.Timestamp(year=anio, month=mes_num, day=dia)
+            except ValueError:
+                continue
 
-ITEMS_BIBLIOTECA_ADU = {
-    cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"],"color": cat.get("color","")}
-    for cat in BIBLIOTECA_ADUANERA
-}
+            registro = {"fecha": fecha}
+            idx = 0
+            for moneda in MONEDAS:
+                for sub in SUBCOLUMNAS:
+                    registro[f"{moneda}_{sub}"] = _limpiar_numero(valores[idx])
+                    idx += 1
+            filas_totales.append(registro)
 
-NAVEGACION = {
-    "Normativa Impositiva": {
-        "icono": "🧾",
-        "descripcion": "Leyes, decretos, resoluciones y digesto en materia tributaria.",
-        "items": {
-            "Leyes":        {"icono": "⚖️", "fuente": "dnit_leyes_imp",        "prefijo": None},
-            "Decretos":     {"icono": "📜", "fuente": "dnit_decretos_imp",     "prefijo": None},
-            "Resoluciones": {"icono": "📑", "fuente": "dnit_resoluciones_imp", "prefijo": None},
-            "Digesto":      {"icono": "📚", "fuente": "digesto_tributario",    "prefijo": None},
-            **ITEMS_BIBLIOTECA_IMP,
-        },
-    },
-    "Normativa Aduanera": {
-        "icono": "🚢",
-        "descripcion": "Leyes, decretos, resoluciones y digesto en materia aduanera.",
-        "items": {
-            "Leyes":        {"icono": "⚖️", "fuente": "dnit_leyes_adu",        "prefijo": None},
-            "Decretos":     {"icono": "📜", "fuente": "dnit_decretos_adu",     "prefijo": None},
-            "Resoluciones": {"icono": "📑", "fuente": "dnit_resoluciones_adu", "prefijo": None},
-            "Digesto":      {"icono": "📚", "fuente": "digesto_aduanero",    "prefijo": None},
-            **ITEMS_BIBLIOTECA_ADU,
-        },
-    },
-    "Cotizaciones": {
-        "icono": "💱",
-        "descripcion": "Historial de tipos de cambio publicados por la DNIT.",
-        "items": {
-            "Historial": {"icono": "📈", "fuente": "dnit_cotizaciones", "prefijo": None},
-        },
-    },
-}
+    df = pd.DataFrame(filas_totales)
+    if not df.empty:
+        df = df.sort_values("fecha").drop_duplicates(subset="fecha").reset_index(drop=True)
+        df["fecha"] = df["fecha"].dt.strftime("%Y-%m-%d")
+    return df
 
-COLUMN_CONFIG_NORMAS = {
-    "Sección": st.column_config.TextColumn("Sección", width="small"),
-    "Fecha": st.column_config.TextColumn("Fecha", width="small"),
-    "Título": st.column_config.TextColumn("Título", width="medium"),
-    "Descripción": st.column_config.TextColumn("Descripción", width="large"),
-    "Enlace Descargar": st.column_config.LinkColumn(
-        "Enlace Descargar", display_text="📄 Abrir archivo"
-    ),
-    "Enlace Ver": st.column_config.LinkColumn(
-        "Enlace Ver", display_text="🌐 Ver Detalle"
-    ),
-}
-
-# ---------------------------------------------------------------------------
-# ESTADO Y NAVEGACION
-# ---------------------------------------------------------------------------
-st.session_state.setdefault("seccion", None)
-st.session_state.setdefault("tipo", None)
+_RE_TITULO_GENERAL = re.compile(r"^\s*to(do|da)s\s+(los|las)\b", re.IGNORECASE)
 
 
-def ir_a(seccion: str, tipo: str):
-    st.session_state.seccion = seccion
-    st.session_state.tipo = tipo
+def _tipo_enlace(a) -> str:
+    """Clasifica un <a> como 'descargar' o 'ver' (ignora los textos de los iconos)."""
+    texto = a.get_text(" ", strip=True).lower()
+    for icono in ("download", "visibility"):
+        texto = texto.replace(icono, "")
+    texto = texto.strip()
+    return texto if texto in ("descargar", "ver") else ""
 
 
-def volver_inicio():
-    st.session_state.seccion = None
-    st.session_state.tipo = None
-    st.query_params.clear()
+def _recolectar_registro(titulo_tag, tags_corte: tuple, url_base: str):
+    """Desde un tag de titulo, junta el texto (descripcion) y clasifica los
+    enlaces 'Descargar'/'Ver' que le siguen, hasta el proximo tag cuyo nombre
+    este en tags_corte (el siguiente registro, seccion o el pie de pagina)."""
+    partes, link_descargar, link_ver, vio_enlace = [], "", "", False
+    for el in titulo_tag.next_elements:
+        if any(padre is titulo_tag for padre in el.parents):
+            continue  # texto del propio titulo
+        if isinstance(el, Tag):
+            if el.name in tags_corte:
+                break
+            if el.name == "a":
+                vio_enlace = True
+                tipo = _tipo_enlace(el)
+                href = (el.get("href") or "").strip()
+                if tipo and href and not href.startswith(("#", "javascript")):
+                    enlace = urljoin(url_base, href)
+                    if tipo == "descargar" and not link_descargar:
+                        link_descargar = enlace
+                    elif tipo == "ver" and not link_ver:
+                        link_ver = enlace
+        elif type(el) is NavigableString and not vio_enlace and el.find_parent("a") is None:
+            texto = " ".join(str(el).split())
+            if texto:
+                partes.append(texto)
+    return " ".join(partes), link_descargar, link_ver
 
 
-# ---------------------------------------------------------------------------
-# DATOS (con cache para que navegar no vuelva a descargar todo)
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def cargar(termino: str, fuente_id: str | None):
-    _, df = ejecutar_busqueda(termino, fuente_id)
+def parser_dnit_normativa(html: str, url_base: str = "https://www.dnit.gov.py",
+                          max_chars: int = None) -> pd.DataFrame:
+    """Parser unico para las paginas de normativas de dnit.gov.py
+    (leyes, decretos, resoluciones; impositivas y aduaneras).
+
+    Cada registro es un <h3> (titulo) seguido de una descripcion y de los enlaces
+    'Descargar' y/o 'Ver'. No depende de contenedores: recorre los elementos que
+    siguen a cada titulo hasta el proximo titulo, asi tolera registros sin
+    descripcion, sin 'Descargar' o con 'Ver' vacio.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    filas = []
+
+    marcador = soup.find("h3", string=_RE_TITULO_GENERAL)
+    encabezados = marcador.find_all_next("h3") if marcador else soup.find_all("h3")
+
+    for encabezado in encabezados:
+        titulo = " ".join(encabezado.get_text(" ", strip=True).split())
+        if not titulo or _RE_TITULO_GENERAL.match(titulo):
+            continue
+
+        descripcion, link_descargar, link_ver = _recolectar_registro(
+            encabezado, ("h1", "h2", "h3", "h4", "footer"), url_base
+        )
+        if not (link_descargar or link_ver):
+            continue
+
+        if max_chars and len(descripcion) > max_chars:
+            descripcion = descripcion[:max_chars].strip() + "..."
+
+        filas.append({
+            "Título": titulo,
+            "Descripción": descripcion,
+            "Enlace Descargar": link_descargar,
+            "Enlace Ver": link_ver,
+        })
+
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        df = df.drop_duplicates(
+            subset=["Título", "Enlace Descargar", "Enlace Ver"]
+        ).reset_index(drop=True)
     return df
 
 
-def panel_descarga(fila, clave: str):
-    url = fila.get("Enlace Descargar", "")
-    ver = fila.get("Enlace Ver", "")
-    titulo = fila.get("Título", "archivo")
-    st.markdown(f"**{titulo}**")
+parser_dnit_decretos = parser_dnit_normativa
 
-    if not url:
-        st.info("Este registro no tiene archivo para descargar.")
-        if ver:
-            st.link_button("🌐 Ver detalle", ver)
-        return
+# ---------------------------------------------------------------------------
+# BIBLIOTECA IMPOSITIVA Y ADUANERA
+# ---------------------------------------------------------------------------
 
-    nombre = nombre_archivo(url, titulo)
+SECCIONES_BIBLIOTECA = ("Normativas", "Guías")
+_RE_FECHA_BIBLIOTECA = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+
+
+def _fecha_antes_de(titulo_tag) -> str:
+    for el in titulo_tag.previous_elements:
+        if isinstance(el, Tag) and el.name in ("h1", "h2", "h3", "h4", "h5", "h6", "a"):
+            return ""
+        if type(el) is NavigableString:
+            texto = str(el).strip()
+            if texto:
+                return texto if _RE_FECHA_BIBLIOTECA.match(texto) else ""
+    return ""
+
+
+def parser_biblioteca_categoria(html: str, url_base: str = "https://www.dnit.gov.py",
+                                max_chars: int = None) -> pd.DataFrame:
+    soup = BeautifulSoup(html, "html.parser")
+    filas = []
+
+    for etiqueta in SECCIONES_BIBLIOTECA:
+        encabezado_seccion = soup.find(
+            lambda t: t.name in ("h1", "h2", "h3") and t.get_text(strip=True).lower() == etiqueta.lower()
+        )
+        if encabezado_seccion is None:
+            continue
+        limite = encabezado_seccion.find_next(["h1", "h2", "h3"])
+
+        titulos = []
+        for el in encabezado_seccion.next_elements:
+            if limite is not None and el is limite:
+                break
+            if isinstance(el, Tag) and el.name in ("h4", "h5", "h6"):
+                titulos.append(el)
+
+        for titulo_tag in titulos:
+            titulo = " ".join(titulo_tag.get_text(" ", strip=True).split())
+            if not titulo:
+                continue
+
+            descripcion, link_descargar, link_ver = _recolectar_registro(
+                titulo_tag, ("h1", "h2", "h3", "h4", "h5", "h6", "footer"), url_base
+            )
+            if not (link_descargar or link_ver):
+                continue
+
+            if max_chars and len(descripcion) > max_chars:
+                descripcion = descripcion[:max_chars].strip() + "..."
+
+            filas.append({
+                "Sección": etiqueta,
+                "Fecha": _fecha_antes_de(titulo_tag),
+                "Título": titulo,
+                "Descripción": descripcion,
+                "Enlace Descargar": link_descargar,
+                "Enlace Ver": link_ver,
+            })
+
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        df = df.drop_duplicates(
+            subset=["Título", "Enlace Descargar", "Enlace Ver"]
+        ).reset_index(drop=True)
+    return df
+
+def _parser_biblioteca_generico(html: str, url_base: str = "https://www.dnit.gov.py",
+                                max_chars: int = None) -> pd.DataFrame:
+    soup = BeautifulSoup(html, "html.parser")
+    filas = []
+    for titulo_tag in soup.find_all(["h2", "h3", "h4", "h5", "h6"]):
+        titulo = " ".join(titulo_tag.get_text(" ", strip=True).split())
+        if not titulo or _RE_TITULO_GENERAL.match(titulo):
+            continue
+        descripcion, link_descargar, link_ver = _recolectar_registro(
+            titulo_tag, ("h1", "h2", "h3", "h4", "h5", "h6", "footer", "nav"), url_base
+        )
+        if not (link_descargar or link_ver):
+            continue
+        if max_chars and len(descripcion) > max_chars:
+            descripcion = descripcion[:max_chars].strip() + "..."
+        filas.append({
+            "Título": titulo,
+            "Descripción": descripcion,
+            "Enlace Descargar": link_descargar,
+            "Enlace Ver": link_ver,
+        })
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        df = df.drop_duplicates(
+            subset=["Título", "Enlace Descargar", "Enlace Ver"]
+        ).reset_index(drop=True)
+    return df
+
+
+def parser_biblioteca_aduanera(html: str, url_base: str = "https://www.dnit.gov.py",
+                               max_chars: int = None) -> pd.DataFrame:
+    for estrategia in (parser_dnit_normativa, parser_biblioteca_categoria, _parser_biblioteca_generico):
+        df = estrategia(html, url_base, max_chars)
+        if not df.empty:
+            return df
+    return pd.DataFrame()
+
+
+def _limpiar_numero(texto: str):
+    texto = (texto or "").strip()
+    if not texto or texto.upper() in ("ND", "-", "N/D"):
+        return None
+    texto = texto.replace(".", "").replace(",", ".")
     try:
-        with st.spinner("Preparando archivo..."):
-            contenido, tipo_mime = descargar_archivo(url)
-    except (requests.RequestException, ValueError) as error:
-        st.error(f"No se pudo preparar la descarga ({error}).")
-        st.link_button("Abrir el enlace directo", url)
-        return
+        return float(texto)
+    except ValueError:
+        return None
 
-    st.download_button(
-        f"📥 Descargar {nombre}",
-        data=contenido,
-        file_name=nombre,
-        mime=tipo_mime,
-        key=f"dl_{clave}",
-    )
+URL_DIGESTO = "https://digestolegislativo.gov.py"
+_RE_ENCABEZADO = re.compile(r"^h[1-6]$")
+_RE_PROMULGACION = re.compile(r"Promulgaci[oó]n\W*([\d/\-]+)", re.IGNORECASE)
+_RE_SANCION = re.compile(r"Sanci[oó]n\W*([\d/\-]+)", re.IGNORECASE)
+_RE_SEPARAR_TITULO = re.compile(r"^(.+?\b\d{4})\.\s+(.*)$", re.DOTALL)
 
 
-def mostrar_tabla(df, fuente, clave: str = "tabla"):
-    if df.empty:
-        st.warning("No se encontraron resultados para la búsqueda ingresada.")
-        return
+def parser_digesto(html: str, url_base: str = URL_DIGESTO, max_chars: int = None) -> pd.DataFrame:
+    soup = BeautifulSoup(html, "html.parser")
 
-    opciones = {"width": "stretch", "hide_index": True}
-    if "Enlace Ver" in df.columns:
-        opciones["column_config"] = COLUMN_CONFIG_NORMAS
+    titulos = [
+        a for a in soup.find_all("a", href=True)
+        if "detalles" in a["href"] and a.find_parent(_RE_ENCABEZADO)
+    ]
+    if not titulos:
+        titulos = [
+            a for a in soup.find_all("a", href=True)
+            if "detalles" in a["href"] and len(a.get_text(strip=True)) > 40
+        ]
+    ids_titulo = {id(a) for a in titulos}
 
-    if "Enlace Descargar" not in df.columns:
-        st.dataframe(df, **opciones)
-        return
+    filas = []
+    for ancla in titulos:
+        texto_titulo = " ".join(ancla.get_text(" ", strip=True).split())
+        if not texto_titulo:
+            continue
 
-    evento = st.dataframe(
-        df, key=clave, on_select="rerun", selection_mode="single-row", **opciones
-    )
-    filas = evento.selection.rows
-    if filas and filas[0] < len(df):
-        panel_descarga(df.iloc[filas[0]], clave)
-    else:
-        st.caption("💡 Selecciona una fila (casilla de la izquierda) para descargar su archivo.")
+        textos, link_pdf = [], ""
+        for el in ancla.next_elements:
+            if any(padre is ancla for padre in el.parents):
+                continue
+            if isinstance(el, Tag):
+                if el.name == "a":
+                    if id(el) in ids_titulo:
+                        break
+                    href = (el.get("href") or "").strip()
+                    nombre = el.get_text(strip=True).lower()
+                    if not link_pdf and href and (nombre == "pdf" or href.lower().replace(" ", "").endswith(".pdf")):
+                        link_pdf = urljoin(url_base, href.replace(" ", "%20"))
+            elif type(el) is NavigableString:
+                textos.append(str(el))
+
+        bloque = " ".join(" ".join(textos).split())
+        prom = _RE_PROMULGACION.search(bloque)
+        sanc = _RE_SANCION.search(bloque)
+
+        m = _RE_SEPARAR_TITULO.match(texto_titulo)
+        if m:
+            titulo, descripcion = m.group(1), m.group(2)
+        else:
+            titulo, _, descripcion = texto_titulo.partition(". ")
+        if max_chars and len(descripcion) > max_chars:
+            descripcion = descripcion[:max_chars].strip() + "..."
+
+        filas.append({
+            "Título": titulo.strip(),
+            "Descripción": descripcion.strip(),
+            "Promulgación": prom.group(1) if prom else "",
+            "Sanción": sanc.group(1) if sanc else "",
+            "Enlace Descargar": link_pdf,
+            "Enlace Ver": urljoin(url_base, ancla["href"].strip().replace(" ", "%20")),
+        })
+
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        df = df.drop_duplicates(subset="Enlace Ver").reset_index(drop=True)
+    return df
 
 
-def normalizar(texto: str) -> str:
-    texto = unicodedata.normalize("NFD", str(texto).lower())
-    return "".join(c for c in texto if unicodedata.category(c) != "Mn")
-
-
-def filtrar_df(df, texto: str):
-    tokens = normalizar(texto).split()
-    if df.empty or not tokens:
-        return df
-    filas = df.astype(str).apply(lambda col: col.map(normalizar)).apply(" ".join, axis=1)
-    mascara = filas.apply(lambda fila: all(t in fila for t in tokens))
-    return df[mascara].reset_index(drop=True)
-
-
-def obtener_df(item: dict, filtro: str):
-    df = cargar("", item["fuente"])
-    if item["prefijo"] and "Título" in df.columns:
-        df = df[
-            df["Título"].str.lower().str.startswith(item["prefijo"].lower())
-        ].reset_index(drop=True)
-    return filtrar_df(df, filtro)
-
-
-def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
-                    con_titulo: bool = True, clave: str = "sec"):
-    if con_titulo:
-        st.markdown(f"##### {item['icono']} {tipo}")
-
-    if item["fuente"] is None:
-        st.info(f"**{tipo}** de **{seccion}** todavía no tiene una fuente configurada (próximamente).")
-        return
-
-    fuente = obtener_fuente(item["fuente"])
-    clave_filtro = f"filtro_{clave}_{seccion}_{tipo}"
-    if item.get("filtro_fijo") and clave_filtro not in st.session_state:
-        st.session_state[clave_filtro] = item["filtro_fijo"]
-    local = st.text_input(
-        f"Filtrar dentro de {tipo}",
-        key=clave_filtro,
-        placeholder="Número, año, palabra clave...",
-    )
-    filtro = f"{filtro_base} {local}".strip()
-
-    with st.spinner("Extrayendo datos..."):
-        df = obtener_df(item, filtro)
-
-    detalle = f"  ·  Filtro del buscador: «{filtro_base}»" if filtro_base else ""
-    st.caption(f"Fuente: {fuente['nombre']} ({len(df)} filas) - {fuente['url']}{detalle}")
-    mostrar_tabla(df, fuente, clave=f"tabla_{clave}_{seccion}_{tipo}")
+def parser_generico(html: str) -> pd.DataFrame:
+    tablas = pd.read_html(html)
+    if not tablas:
+        return pd.DataFrame()
+    tabla_mas_grande = max(tablas, key=lambda t: t.size)
+    return tabla_mas_grande
 
 
 # ---------------------------------------------------------------------------
-# INTERPRETACION DEL BUSCADOR GENERAL
+# REGISTRO DE FUENTES
 # ---------------------------------------------------------------------------
-ALIAS_TIPO = {
-    "ley": "Leyes", "leyes": "Leyes",
-    "decreto": "Decretos", "decretos": "Decretos",
-    "resolucion": "Resoluciones", "resoluciones": "Resoluciones",
-    "digesto": "Digesto", "digestos": "Digesto", "digesta": "Digesto", "digestas": "Digesto",
-    "iva": "IVA", "irp": "IRP", "ire": "IRE", "idu": "IDU", "inr": "INR", "isc": "ISC",
-    "iresimple": "IRE RESIMPLE",
-}
-ALIAS_SECCION = {
-    "impositiva": "Normativa Impositiva", "impositivo": "Normativa Impositiva",
-    "tributaria": "Normativa Impositiva", "tributario": "Normativa Impositiva",
-    "impuesto": "Normativa Impositiva", "impuestos": "Normativa Impositiva",
-    "aduanera": "Normativa Aduanera", "aduanero": "Normativa Aduanera",
-    "aduana": "Normativa Aduanera", "aduanas": "Normativa Aduanera",
-    "cotizacion": "Cotizaciones", "cotizaciones": "Cotizaciones",
-    "dolar": "Cotizaciones", "divisas": "Cotizaciones", "guaranies": "Cotizaciones",
-    "cambio": "Cotizaciones", "tipo": "Cotizaciones",
-}
-ALIAS_TODOS = {
-    **{a: ("tipo", v) for a, v in ALIAS_TIPO.items()},
-    **{a: ("seccion", v) for a, v in ALIAS_SECCION.items()},
-}
-PALABRAS_RELLENO = {"de", "del", "la", "el", "los", "las", "en", "y", "dnit",
-                    "legislativo", "norma", "normas", "normativa"}
-MIN_PREFIJO = 3   
-MIN_TIPEO = 4     
+
+FUENTES = [
+    {
+        "id": "dnit_cotizaciones",
+        "nombre": "DNIT - Historial de Cotizaciones",
+        "alias": ["dnit", "cotizaciones", "dolar", "tipo de cambio", "divisas", "guaranies"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/cotizaciones",
+        "categoria": "cotizaciones",
+        "parser": parser_dnit,
+    },
+    {
+        "id": "dnit_leyes_imp",
+        "nombre": "DNIT - Leyes (Impositiva)",
+        "alias": ["leyes impositivas"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/leyes",
+        "categoria": "impositiva",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_decretos_imp",
+        "nombre": "DNIT - Decretos (Impositiva)",
+        "alias": ["decreto tributario", "decretos impositivos"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/decretos",
+        "categoria": "impositiva",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_resoluciones_imp",
+        "nombre": "DNIT - Resoluciones (Impositiva)",
+        "alias": ["resoluciones impositivas"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/resoluciones",
+        "categoria": "impositiva",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_leyes_adu",
+        "nombre": "DNIT - Leyes (Aduanera)",
+        "alias": ["leyes aduaneras"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/leyes1",
+        "categoria": "aduanera",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_decretos_adu",
+        "nombre": "DNIT - Decretos (Aduanera)",
+        "alias": ["decretos aduaneros"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/decretos1",
+        "categoria": "aduanera",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "dnit_resoluciones_adu",
+        "nombre": "DNIT - Resoluciones (Aduanera)",
+        "alias": ["resoluciones aduaneras"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/resoluciones1",
+        "categoria": "aduanera",
+        "parser": parser_dnit_normativa,
+    },
+    {
+        "id": "digesto_tributario",
+        "nombre": "Digesto Legislativo - Tributario en general",
+        "alias": ["digesto", "legislativo", "norma", "ley"],
+        "url": "https://digestolegislativo.gov.py/9-tributarios/308/91-tributario-en-general",
+        "url_datos": "https://digestolegislativo.gov.py/paginacion/interna.php?id=308&action=ajax&page={pagina}",
+        "categoria": "impositiva",
+        "parser": parser_digesto,
+    },
+    {
+        "id": "digesto_aduanero",
+        "nombre": "Digesto Legislativo - Aduanero",
+        "alias": ["digesto aduanero"],
+        "url": "https://digestolegislativo.gov.py/9-tributarios/309/92-aduanero",
+        "url_datos": "https://digestolegislativo.gov.py/paginacion/interna.php?id=309&action=ajax&page={pagina}",
+        "categoria": "aduanera",
+        "parser": parser_digesto,
+    },
+    {
+        "id": "dnit_biblioteca_iva",
+        "nombre": "DNIT - Biblioteca IVA",
+        "alias": ["iva"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/iva",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_irp",
+        "nombre": "DNIT - Biblioteca IRP",
+        "alias": ["irp"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/irp",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_ire",
+        "nombre": "DNIT - Biblioteca IRE",
+        "alias": ["ire"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/ire",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_idu",
+        "nombre": "DNIT - Biblioteca IDU",
+        "alias": ["idu"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/idu",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_inr",
+        "nombre": "DNIT - Biblioteca INR",
+        "alias": ["inr"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/inr",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_isc",
+        "nombre": "DNIT - Biblioteca ISC",
+        "alias": ["isc"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/isc",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_aduanera",
+        "nombre": "DNIT - Biblioteca Aduanera",
+        "alias": ["biblioteca aduanera"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/aduanera",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_aduanera,
+    },
+    {
+        "id": "dnit_biblioteca_ire_resimple",
+        "nombre": "DNIT - Biblioteca IRE RESIMPLE",
+        "alias": ["ire resimple", "resimple"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/ire-resimple",
+        "categoria": "impositiva",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_pvaa",
+        "nombre": "DNIT - Biblioteca PVAA",
+        "alias": ["pvaa"],
+        "url": "https://www.dnit.gov.py/en/web/portal-institucional/personas-vinculadas-a-la-actividad-aduanera",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_vui",
+        "nombre": "DNIT - Biblioteca VUI",
+        "alias": ["vui"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/vui",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_kitapp",
+        "nombre": "DNIT - Biblioteca KITAPP",
+        "alias": ["kitapp"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/kitapp",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_tvf",
+        "nombre": "DNIT - Biblioteca TVF",
+        "alias": ["tvf"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/trafico-vecinal-fronterizo",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_remesa_expresa",
+        "nombre": "DNIT - Biblioteca Remesa Expresa",
+        "alias": ["remesa","expresa"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/remesa-expresa",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+    {
+        "id": "dnit_biblioteca_remates",
+        "nombre": "DNIT - Biblioteca Remates",
+        "alias": ["remate","remates"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/remates-y-comercializacion-de-mercaderias",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+   {
+        "id": "dnit_biblioteca_regimenes",
+        "nombre": "DNIT - Biblioteca Regímenes",
+        "alias": ["regimen","regimenes"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/regímenes-aduaneros",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+   {
+        "id": "dnit_biblioteca_oea",
+        "nombre": "DNIT - Biblioteca OEA",
+        "alias": ["oea","operador","económico","autorizado"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/oea-operador-economico-autorizado",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+   {
+        "id": "dnit_biblioteca_mesa",
+        "nombre": "DNIT - Biblioteca Mesa de Entrada",
+        "alias": ["mesa","entrada"],
+        "url": "https://secure.aduana.gov.py/dna-apps/public/consultaExpediente",
+        "categoria": "aduanera",
+        "parser": parser_biblioteca_categoria,
+    },
+]
+
+# Bibliotecas con sus respectivos colores institucionales
+BIBLIOTECA_IMPOSITIVA = [
+    {"nombre": "IVA", "fuente": "dnit_biblioteca_iva",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-iva.svg/b5ec899c-8bcd-28fa-5498-b33b11db275e?t=1678484263694",
+     "color": "#0284c7"},
+    {"nombre": "IRP", "fuente": "dnit_biblioteca_irp",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-irp.svg/bad8c8e3-9a57-e079-4bfe-e7638a4e32f6?t=1678484263863",
+     "color": "#eab308"},
+    {"nombre": "IRE", "fuente": "dnit_biblioteca_ire",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-ire.svg/54b7b93d-a677-3a4b-42d2-432ec08e5735?t=1678484263808",
+     "color": "#0d9488"},
+    {"nombre": "IDU", "fuente": "dnit_biblioteca_idu",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/logo-idu+%281%29.svg/f9143016-5782-cc0f-a947-dd8276f97742?t=1678825637846",
+     "color": "#9d174d"},
+    {"nombre": "INR", "fuente": "dnit_biblioteca_inr",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-inr.svg/86eb7c2e-0a8c-40a5-9ec1-9405c369b6fe?t=1678484263567",
+     "color": "#15803d"},
+    {"nombre": "ISC", "fuente": "dnit_biblioteca_isc",
+     "logo": "https://www.dnit.gov.py/documents/44828/50401/logo-isc.svg/eac5b04c-5626-99d6-9b3a-f525321019d2?t=1678484263637",
+     "color": "#4b5563"},
+    {"nombre": "IRE RESIMPLE", "fuente": "dnit_biblioteca_ire_resimple",
+     "logo": "https://www.dnit.gov.py/documents/20123/251762/logo-ire-simple.svg/d60f9112-3c2c-cef7-bdd0-18742b3c3cce?t=1683762469002",
+     "color": "#06b6d4"},
+]
+
+BIBLIOTECA_ADUANERA = [
+    {"nombre": "PVAA", "fuente": "dnit_biblioteca_pvaa",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/BOTON+PVAA+108X48_Mesa+de+trabajo+1.png/af50fc21-805e-602c-9a84-7c463dc58910?t=1753906959193",
+     "color": "#6b7280"},
+    {"nombre": "VUI", "fuente": "dnit_biblioteca_vui",
+     "logo": "https://www.dnit.gov.py/documents/20123/1067002/logo-vui.svg/a2adf0b8-b232-267b-38c4-9fb934ad1c38?t=1726087798981",
+     "color": "#7c3aed"},
+    {"nombre": "KITAPP", "fuente": "dnit_biblioteca_kitapp",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/logo-regimenes.svg/677fa80b-0709-40df-49fa-6b53af1ed358?t=1727216298868",
+     "color": "#059669"},
+    {"nombre": "TVF", "fuente": "dnit_biblioteca_tvf",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/logo-tvf.svg/b7312864-7c10-d7a8-76dc-f231056e986d?t=1727215159186",
+     "color": "#d97706"},
+    {"nombre": "REMESAS", "fuente": "dnit_biblioteca_remesa_expresa",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/Logos+Impuestos+2024-09.png/acc51853-a560-1b9a-463b-d52c14ab7220?t=1732132256094",
+     "color": "#c026d3"},
+    {"nombre": "REMATES", "fuente": "dnit_biblioteca_remates",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/logo-remates.svg/e1c824c6-e5fd-dcc4-dc5a-609ced87cdf2?t=1727216226837",
+     "color": "#1d4ed8"},
+    {"nombre": "REGIMENES", "fuente": "dnit_biblioteca_regimenes",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/logo-regimenes.svg/677fa80b-0709-40df-49fa-6b53af1ed358?t=1727216298868",
+     "color": "#16a34a"},
+    {"nombre": "OEA", "fuente": "dnit_biblioteca_oea",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/Logos+Impuestos+2024-08+%281%29.png/6702f7ef-7d0e-893d-275b-720d4fa79fc7?t=1732144616029",
+     "color": "#dc2626"},
+    {"nombre": "MESA DE ENTRADA", "fuente": "dnit_biblioteca_mesa",
+     "logo": "https://www.dnit.gov.py/documents/44828/0/logo-mesa-de-entrada.svg/b27b55a8-c48c-35a3-0e99-af73f6371a14?t=1727216341673",
+     "color": "#312e81"},
+]
+
+def obtener_fuente(fuente_id: str):
+    return next((f for f in FUENTES if f["id"] == fuente_id), None)
 
 
-def reconocer(palabra: str):
-    if palabra in ALIAS_TODOS:
-        return ALIAS_TODOS[palabra]
+def buscar_fuente(termino: str, fuentes=FUENTES):
+    termino_norm = termino.lower().strip()
+    if not termino_norm:
+        return None
 
-    if len(palabra) >= MIN_PREFIJO:
-        candidatos = {v for alias, v in ALIAS_TODOS.items() if alias.startswith(palabra)}
-        if len(candidatos) == 1:
-            return candidatos.pop()
-        if len(candidatos) > 1:
-            return None  
+    for fuente in fuentes:
+        textos = [fuente["nombre"].lower()] + [a.lower() for a in fuente["alias"]]
+        if any(termino_norm in t or t in termino_norm for t in textos):
+            return fuente
 
-    if len(palabra) >= MIN_TIPEO:
-        parecidos = difflib.get_close_matches(palabra, ALIAS_TODOS.keys(), n=1, cutoff=0.8)
-        if parecidos:
-            return ALIAS_TODOS[parecidos[0]]
+    todos_alias = {}
+    for fuente in fuentes:
+        for alias in fuente["alias"] + [fuente["nombre"]]:
+            todos_alias[alias.lower()] = fuente
+
+    coincidencias = difflib.get_close_matches(
+        termino_norm, todos_alias.keys(), n=1, cutoff=0.6
+    )
+    if coincidencias:
+        return todos_alias[coincidencias[0]]
+
     return None
 
-
-def interpretar(termino: str):
-    secciones, tipos, resto = [], [], []
-    for original in termino.lower().split():
-        norm = normalizar(original)
-        if norm in PALABRAS_RELLENO:
-            continue
-        hallado = reconocer(norm)
-        if hallado is None:
-            resto.append(original)
-        elif hallado[0] == "seccion":
-            if hallado[1] not in secciones:
-                secciones.append(hallado[1])
-        else:
-            if hallado[1] not in tipos:
-                tipos.append(hallado[1])
-    return secciones, tipos, " ".join(resto)
+def obtener_html(url: str, extra_headers: dict = None) -> str:
+    headers = {**HEADERS, **(extra_headers or {})}
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
 
-def destinos(secciones: list, tipos: list):
-    salida = []
-    for seccion, datos in NAVEGACION.items():
-        if secciones and seccion not in secciones:
-            continue
-        if seccion == "Cotizaciones" and seccion not in secciones:
-            continue  
-        for tipo, item in datos["items"].items():
-            if tipos and seccion != "Cotizaciones" and tipo not in tipos:
-                continue
-            salida.append((seccion, tipo, item))
-    return salida
+def _tiene_normas(html: str) -> bool:
+    return "romulgaci" in html
 
 
-# ---------------------------------------------------------------------------
-# ESTILOS (Actualizados con los colores institucionales de la DNIT)
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-      .header-dnit {
-        background-color: #0b132b;
-        padding: 24px 20px 18px 20px;
-        border-radius: 12px;
-        text-align: center;
-        margin-bottom: 1.5rem;
-        border-bottom: 4px solid #3b82f6;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
-      }
-      .header-dnit img { max-height: 70px; margin-bottom: 0.8rem; object-fit: contain; }
-      .header-dnit h1 { color: #ffffff; margin: 0; padding: 0; font-size: 2rem; font-weight: 700; }
-      .header-dnit p { color: #94a3b8; margin: 0.4rem 0 0 0; font-size: 1rem; }
-      .tarjeta-titulo { font-size: 1.3rem; font-weight: 600; margin: 0; }
-      .tarjeta-desc { color: #64748b; font-size: 0.92rem; margin: 0.2rem 0 0.8rem 0; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def _total_paginas(html: str) -> int:
+    soup = BeautifulSoup(html, "html.parser")
+    numeros = [
+        int(a.get_text(strip=True)) for a in soup.find_all("a")
+        if a.get_text(strip=True).isdigit() and "javascript" in (a.get("href") or "")
+    ]
+    return max(numeros, default=1)
 
-# ---------------------------------------------------------------------------
-# CABECERA + BUSCADOR GENERAL
-# ---------------------------------------------------------------------------
-st.markdown(
-    f"""
-    <div class="header-dnit">
-      <img src="{LOGO_URL}" alt="Logo DNIT">
-      <h1>Buscador General</h1>
-      <p>Sistema de consulta y filtrado de datos institucionales</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
-termino = st.text_input(
-    "Buscar",
-    key="termino_general",
-    placeholder="Escribe una palabra clave (ej: dnit, dolar, decreto, ley)...",
-    label_visibility="collapsed",
-)
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_html_paginado(url_plantilla: str, max_paginas: int = 100) -> str:
+    extra = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://digestolegislativo.gov.py/",
+    }
 
-if termino.strip():
-    secciones, tipos, resto = interpretar(termino)
+    def bajar(pagina):
+        try:
+            return obtener_html(url_plantilla.format(pagina=pagina), extra)
+        except requests.RequestException:
+            return ""
 
-    if secciones or tipos:
-        por_seccion = {}
-        for seccion, tipo, item in destinos(secciones, tipos):
-            por_seccion.setdefault(seccion, []).append((tipo, item))
+    primera = obtener_html(url_plantilla.format(pagina=1), extra)
+    if not _tiene_normas(primera):
+        return primera
 
-        st.caption("Borra el texto del buscador para volver al inicio.")
+    partes = [primera]
+    total = min(_total_paginas(primera), max_paginas)
 
-        def pintar(seccion, lista):
-            for tipo, item in lista:
-                mostrar_destino(seccion, tipo, item, resto, con_titulo=True, clave="busq")
+    if total > 1:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for html in pool.map(bajar, range(2, total + 1)):
+                if html and _tiene_normas(html):
+                    partes.append(html)
 
-        if len(por_seccion) > 1:
-            pestanias = st.tabs(
-                [f"{NAVEGACION[sec]['icono']} {sec}" for sec in por_seccion]
-            )
-            for pestania, (seccion, lista) in zip(pestanias, por_seccion.items()):
-                with pestania:
-                    pintar(seccion, lista)
-        else:
-            for seccion, lista in por_seccion.items():
-                st.subheader(f"{NAVEGACION[seccion]['icono']} {seccion}")
-                pintar(seccion, lista)
+    pagina = total + 1
+    while pagina <= max_paginas:
+        html = bajar(pagina)
+        if not html or not _tiene_normas(html) or html in partes:
+            break
+        partes.append(html)
+        pagina += 1
+
+    return "\n".join(partes)
+
+
+_RE_EXTENSION = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|csv|txt|zip|rar)$", re.IGNORECASE)
+_RE_CARACTERES_INVALIDOS = re.compile(r'[\\/:*?"<>|]+')
+
+
+def nombre_archivo(url: str, titulo: str = "archivo") -> str:
+    ruta = unquote_plus(urlparse(url).path)
+    for segmento in reversed(ruta.split("/")):
+        if _RE_EXTENSION.search(segmento):
+            return _RE_CARACTERES_INVALIDOS.sub("_", segmento).strip()
+    base = _RE_CARACTERES_INVALIDOS.sub("_", titulo).strip() or "archivo"
+    return base[:120] + ".pdf"
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=30)
+def descargar_archivo(url: str):
+    extra = {"Referer": "https://digestolegislativo.gov.py/"} if "digestolegislativo" in url else None
+    headers = {**HEADERS, **(extra or {})}
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    tipo = resp.headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
+    if tipo == "text/html":
+        raise ValueError("El servidor devolvió una página web en lugar del archivo.")
+    return resp.content, tipo
+
+
+def ejecutar_busqueda(termino: str, fuente_id: str = None):
+    termino_lower = termino.lower().strip()
+    fuente = obtener_fuente(fuente_id) if fuente_id else buscar_fuente(termino)
+
+    if fuente is None:
+        fuente = FUENTES[0]
+
+    if "url_datos" in fuente:
+        html = obtener_html_paginado(fuente["url_datos"])
     else:
-        with st.spinner("Procesando consulta y extrayendo datos..."):
-            fuente, df_resultado = ejecutar_busqueda(termino)
-        filtro_local = st.text_input(
-            "Filtrar dentro de los resultados",
-            key="filtro_busq_general",
-            placeholder="Número, año, palabra clave...",
-        )
-        df_resultado = filtrar_df(df_resultado, filtro_local)
-        st.caption(
-            f"Fuente: {fuente['nombre']} ({len(df_resultado)} filas) - {fuente['url']}  ·  "
-            "Borra el texto del buscador para volver al inicio."
-        )
-        mostrar_tabla(df_resultado, fuente, clave="tabla_busq_general")
+        html = obtener_html(fuente["url"])
+    df = fuente["parser"](html)
 
-elif st.session_state.seccion:
-    seccion, tipo = st.session_state.seccion, st.session_state.tipo
-    item = NAVEGACION[seccion]["items"][tipo]
+    if df.empty or not termino_lower:
+        return fuente, df
 
-    st.button("← Volver al inicio", on_click=volver_inicio)
-    st.subheader(f"{NAVEGACION[seccion]['icono']} {seccion} › {tipo}")
-    mostrar_destino(seccion, tipo, item, "", con_titulo=False, clave="sec")
+    palabras_ignorar = {"dnit", "cotizaciones", "tipo", "de", "cambio", "divisas", "guaranies",
+                        "digesto", "legislativo", "norma"}
+    tokens = [t for t in termino_lower.split() if t not in palabras_ignorar]
 
-else:
-    col_imp, col_adu = st.columns(2, gap="large")
+    if not tokens:
+        return fuente, df
 
-    for columna, nombre in ((col_imp, "Normativa Impositiva"), (col_adu, "Normativa Aduanera")):
-        datos = NAVEGACION[nombre]
-        with columna, st.container(border=True):
-            st.markdown(
-                f"<p class='tarjeta-titulo'>{datos['icono']} {nombre}</p>"
-                f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
-                unsafe_allow_html=True,
-            )
-            items_normales = {
-                t: i for t, i in datos["items"].items()
-                if "logo" not in i and "filtro_fijo" not in i
-            }
-            items_logo = {t: i for t, i in datos["items"].items() if "logo" in i}
+    df_str = df.astype(str).apply(lambda col: col.str.lower())
+    
+    filtro = pd.Series([True] * len(df), index=df.index)
+    for token in tokens:
+        coincide_token = df_str.apply(lambda row: row.str.contains(token, na=False)).any(axis=1)
+        filtro = filtro & coincide_token
 
-            botones = st.columns(2)
-            for i, (tipo, item) in enumerate(items_normales.items()):
-                etiqueta = f"{item['icono']} {tipo}"
-                if item["fuente"] is None:
-                    etiqueta += " (próximamente)"
-                botones[i % 2].button(
-                    etiqueta,
-                    key=f"btn_{nombre}_{tipo}",
-                    on_click=ir_a,
-                    args=(nombre, tipo),
-                    width="stretch",
-                )
-
-            # Biblioteca donde cada tarjeta de color e imagen es directamente el enlace/botón de acceso
-            if items_logo:
-                st.caption("Biblioteca")
-                columnas_logo = st.columns(4)
-                for i, (tipo, item) in enumerate(items_logo.items()):
-                    with columnas_logo[i % 4]:
-                        color_fondo = item.get("color", "#1e293b")
-                        url_destino = f"?sec={urllib.parse.quote(nombre)}&tip={urllib.parse.quote(tipo)}"
-                        
-                        st.markdown(
-                            f"""
-                            <a href="{url_destino}" target="_self" style="text-decoration: none;">
-                                <div style="background-color: {color_fondo}; padding: 12px; border-radius: 8px; 
-                                text-align: center; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; height: 65px; transition: filter 0.2s ease;"
-                                onmouseover="this.style.filter='brightness(1.15)'" onmouseout="this.style.filter='brightness(1)'" title="{tipo}">
-                                    <img src="{item['logo']}" style="max-height: 40px; max-width: 100%; object-fit: contain;">
-                                </div>
-                            </a>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-    datos = NAVEGACION["Cotizaciones"]
-    with st.container(border=True):
-        st.markdown(
-            f"<p class='tarjeta-titulo'>{datos['icono']} Cotizaciones</p>"
-            f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
-            unsafe_allow_html=True,
-        )
-        st.button(
-            "📈 Ver historial de cotizaciones",
-            key="btn_cotizaciones",
-            on_click=ir_a,
-            args=("Cotizaciones", "Historial"),
-        )
+    df_filtrado = df[filtro].reset_index(drop=True)
+    return fuente, df_filtrado
