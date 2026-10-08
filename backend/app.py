@@ -15,11 +15,13 @@ import requests
 import streamlit as st
 from scraper import (
     BIBLIOTECA_IMPOSITIVA,
+    BIBLIOTECA_ADUANERA,
     descargar_archivo,
     ejecutar_busqueda,
     nombre_archivo,
     obtener_fuente,
 )
+
 
 st.set_page_config(layout="wide", page_title="Buscador DNIT")
 
@@ -37,8 +39,12 @@ LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download
 # fila propia, automáticamente debajo de Leyes/Decretos/Resoluciones/Digesto
 # (sin un botón "Biblioteca" ni pantalla intermedia).
 ITEMS_BIBLIOTECA_IMP = {
-    cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"]}
+    cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"],"color": cat.get("color", "")}
     for cat in BIBLIOTECA_IMPOSITIVA
+}
+ITEMS_BIBLIOTECA_ADUA = {
+    cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"],"color": cat.get("color", "")}
+    for cat in BIBLIOTECA_ADUANERA
 }
 
 NAVEGACION = {
@@ -61,6 +67,7 @@ NAVEGACION = {
             "Decretos":     {"icono": "📜", "fuente": "dnit_decretos_adu",     "prefijo": None},
             "Resoluciones": {"icono": "📑", "fuente": "dnit_resoluciones_adu", "prefijo": None},
             "Digesto":      {"icono": "📚", "fuente": "digesto_aduanero",    "prefijo": None},
+            **ITEMS_BIBLIOTECA_ADUA,
         },
     },
     "Cotizaciones": {
@@ -434,11 +441,22 @@ else:
                 )
 
             if items_biblioteca:
-                st.caption("Biblioteca por impuesto")
+                st.caption("Biblioteca Aduanera ")
                 columnas_logo = st.columns(4)
                 for i, (tipo, item) in enumerate(items_biblioteca.items()):
                     with columnas_logo[i % 4]:
-                        st.image(item["logo"], width=90)
+                        color_fondo = item.get("color", "")
+                        if color_fondo:
+                            st.markdown(
+                                f"""
+                                <div style="background-color: {color_fondo}; padding: 16px; border-radius: 8px; text-align: center; margin-bottom: 6px; display: flex; align-items: center; justify-content: center; height: 75px;">
+                                    <img src="{item['logo']}" style="max-height: 45px; max-width: 100%; object-fit: contain;">
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.image(item["logo"], width=90)
                         st.button(
                             tipo,
                             key=f"btn_{nombre}_{tipo}",
