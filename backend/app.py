@@ -10,6 +10,7 @@ Estructura:
 
 import difflib
 import unicodedata
+import urllib.parse
 
 import requests
 import streamlit as st
@@ -22,28 +23,26 @@ from scraper import (
     obtener_fuente,
 )
 
-
 st.set_page_config(layout="wide", page_title="Buscador DNIT")
 
 LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download=true"
 
+# Sincronizar parámetros de URL para permitir clics directos en los iconos
+if "sec" in st.query_params:
+    st.session_state.seccion = st.query_params["sec"]
+if "tip" in st.query_params:
+    st.session_state.tipo = st.query_params["tip"]
+
 # ---------------------------------------------------------------------------
 # MAPA DE NAVEGACION
-# "fuente": id de la fuente en scraper.FUENTES (None = todavía no configurada)
-# "prefijo": filtra los títulos que empiezan con ese texto (ej. solo "Ley ...")
-# Para habilitar un botón nuevo basta con completar su "fuente" (y "prefijo").
 # ---------------------------------------------------------------------------
-# Un item por impuesto de la Biblioteca (IVA, IRP, IRE...), armado a partir de
-# scraper.BIBLIOTECA_IMPOSITIVA. La clave "logo" es lo que distingue a estos
-# botones de los demás: la pantalla de inicio los dibuja con su logo, en una
-# fila propia, automáticamente debajo de Leyes/Decretos/Resoluciones/Digesto
-# (sin un botón "Biblioteca" ni pantalla intermedia).
 ITEMS_BIBLIOTECA_IMP = {
     cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"],"color": cat.get("color", "")}
     for cat in BIBLIOTECA_IMPOSITIVA
 }
-ITEMS_BIBLIOTECA_ADUA = {
-    cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"],"color": cat.get("color", "")}
+
+ITEMS_BIBLIOTECA_ADU = {
+    cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"],"color": cat.get("color","")}
     for cat in BIBLIOTECA_ADUANERA
 }
 
@@ -67,7 +66,7 @@ NAVEGACION = {
             "Decretos":     {"icono": "📜", "fuente": "dnit_decretos_adu",     "prefijo": None},
             "Resoluciones": {"icono": "📑", "fuente": "dnit_resoluciones_adu", "prefijo": None},
             "Digesto":      {"icono": "📚", "fuente": "digesto_aduanero",    "prefijo": None},
-            **ITEMS_BIBLIOTECA_ADUA,
+            **ITEMS_BIBLIOTECA_ADU,
         },
     },
     "Cotizaciones": {
@@ -107,6 +106,7 @@ def ir_a(seccion: str, tipo: str):
 def volver_inicio():
     st.session_state.seccion = None
     st.session_state.tipo = None
+    st.query_params.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,6 @@ def cargar(termino: str, fuente_id: str | None):
 
 
 def panel_descarga(fila, clave: str):
-    """Boton de descarga real (no previsualizacion) para la fila seleccionada."""
     url = fila.get("Enlace Descargar", "")
     ver = fila.get("Enlace Ver", "")
     titulo = fila.get("Título", "archivo")
@@ -162,7 +161,6 @@ def mostrar_tabla(df, fuente, clave: str = "tabla"):
         st.dataframe(df, **opciones)
         return
 
-    # Con filas seleccionables: al elegir una aparece su boton de descarga
     evento = st.dataframe(
         df, key=clave, on_select="rerun", selection_mode="single-row", **opciones
     )
@@ -174,14 +172,11 @@ def mostrar_tabla(df, fuente, clave: str = "tabla"):
 
 
 def normalizar(texto: str) -> str:
-    """Minúsculas y sin tildes (resolución -> resolucion)."""
     texto = unicodedata.normalize("NFD", str(texto).lower())
     return "".join(c for c in texto if unicodedata.category(c) != "Mn")
 
 
 def filtrar_df(df, texto: str):
-    """Deja las filas donde TODAS las palabras aparecen en alguna columna
-    (sin distinguir mayúsculas ni tildes)."""
     tokens = normalizar(texto).split()
     if df.empty or not tokens:
         return df
@@ -191,8 +186,6 @@ def filtrar_df(df, texto: str):
 
 
 def obtener_df(item: dict, filtro: str):
-    """Carga la fuente completa (cacheada), aplica el prefijo del item
-    (ej. solo 'Ley ...') y después el filtro de texto."""
     df = cargar("", item["fuente"])
     if item["prefijo"] and "Título" in df.columns:
         df = df[
@@ -203,8 +196,6 @@ def obtener_df(item: dict, filtro: str):
 
 def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
                     con_titulo: bool = True, clave: str = "sec"):
-    """Muestra un par sección/tipo: filtro propio + tabla (o aviso 'próximamente').
-    filtro_base = texto que ya venía del buscador general."""
     if con_titulo:
         st.markdown(f"##### {item['icono']} {tipo}")
 
@@ -213,9 +204,12 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
         return
 
     fuente = obtener_fuente(item["fuente"])
+    clave_filtro = f"filtro_{clave}_{seccion}_{tipo}"
+    if item.get("filtro_fijo") and clave_filtro not in st.session_state:
+        st.session_state[clave_filtro] = item["filtro_fijo"]
     local = st.text_input(
         f"Filtrar dentro de {tipo}",
-        key=f"filtro_{clave}_{seccion}_{tipo}",
+        key=clave_filtro,
         placeholder="Número, año, palabra clave...",
     )
     filtro = f"{filtro_base} {local}".strip()
@@ -238,8 +232,6 @@ ALIAS_TIPO = {
     "digesto": "Digesto", "digestos": "Digesto", "digesta": "Digesto", "digestas": "Digesto",
     "iva": "IVA", "irp": "IRP", "ire": "IRE", "idu": "IDU", "inr": "INR", "isc": "ISC",
     "iresimple": "IRE RESIMPLE",
-    # "resimple" (sin la "i") no se usa como alias: comparte el prefijo "res" con
-    # Resoluciones y rompería ese atajo ("res" quedaría ambiguo).
 }
 ALIAS_SECCION = {
     "impositiva": "Normativa Impositiva", "impositivo": "Normativa Impositiva",
@@ -257,13 +249,11 @@ ALIAS_TODOS = {
 }
 PALABRAS_RELLENO = {"de", "del", "la", "el", "los", "las", "en", "y", "dnit",
                     "legislativo", "norma", "normas", "normativa"}
-MIN_PREFIJO = 3   # "dec" ya alcanza para decretos
-MIN_TIPEO = 4     # "desreto" se corrige a decreto
+MIN_PREFIJO = 3   
+MIN_TIPEO = 4     
 
 
 def reconocer(palabra: str):
-    """Devuelve ('tipo'|'seccion', valor) o None.
-    Acepta la palabra completa, un prefijo ("dec", "res", "adu") o un error leve de tipeo."""
     if palabra in ALIAS_TODOS:
         return ALIAS_TODOS[palabra]
 
@@ -272,7 +262,7 @@ def reconocer(palabra: str):
         if len(candidatos) == 1:
             return candidatos.pop()
         if len(candidatos) > 1:
-            return None  # prefijo ambiguo: se trata como texto a filtrar
+            return None  
 
     if len(palabra) >= MIN_TIPEO:
         parecidos = difflib.get_close_matches(palabra, ALIAS_TODOS.keys(), n=1, cutoff=0.8)
@@ -282,7 +272,6 @@ def reconocer(palabra: str):
 
 
 def interpretar(termino: str):
-    """Separa lo escrito en: secciones, tipos y el resto (texto a filtrar)."""
     secciones, tipos, resto = [], [], []
     for original in termino.lower().split():
         norm = normalizar(original)
@@ -301,13 +290,12 @@ def interpretar(termino: str):
 
 
 def destinos(secciones: list, tipos: list):
-    """Pares (sección, tipo, item) de NAVEGACION que corresponden a lo buscado."""
     salida = []
     for seccion, datos in NAVEGACION.items():
         if secciones and seccion not in secciones:
             continue
         if seccion == "Cotizaciones" and seccion not in secciones:
-            continue  # Cotizaciones solo aparece si se la nombra
+            continue  
         for tipo, item in datos["items"].items():
             if tipos and seccion != "Cotizaciones" and tipo not in tipos:
                 continue
@@ -316,15 +304,23 @@ def destinos(secciones: list, tipos: list):
 
 
 # ---------------------------------------------------------------------------
-# ESTILOS
+# ESTILOS (Actualizados con los colores institucionales de la DNIT)
 # ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-      .cabecera { text-align: center; margin: 0.5rem 0 1.5rem 0; }
-      .cabecera img { max-height: 70px; margin-bottom: 0.6rem; }
-      .cabecera h1 { margin: 0; padding: 0; }
-      .cabecera p { color: #64748b; margin: 0.3rem 0 0 0; }
+      .header-dnit {
+        background-color: #0b132b;
+        padding: 24px 20px 18px 20px;
+        border-radius: 12px;
+        text-align: center;
+        margin-bottom: 1.5rem;
+        border-bottom: 4px solid #3b82f6;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+      }
+      .header-dnit img { max-height: 70px; margin-bottom: 0.8rem; object-fit: contain; }
+      .header-dnit h1 { color: #ffffff; margin: 0; padding: 0; font-size: 2rem; font-weight: 700; }
+      .header-dnit p { color: #94a3b8; margin: 0.4rem 0 0 0; font-size: 1rem; }
       .tarjeta-titulo { font-size: 1.3rem; font-weight: 600; margin: 0; }
       .tarjeta-desc { color: #64748b; font-size: 0.92rem; margin: 0.2rem 0 0.8rem 0; }
     </style>
@@ -333,11 +329,11 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
-# CABECERA + BUSCADOR GENERAL (siempre visible)
+# CABECERA + BUSCADOR GENERAL
 # ---------------------------------------------------------------------------
 st.markdown(
     f"""
-    <div class="cabecera">
+    <div class="header-dnit">
       <img src="{LOGO_URL}" alt="Logo DNIT">
       <h1>Buscador General</h1>
       <p>Sistema de consulta y filtrado de datos institucionales</p>
@@ -353,12 +349,6 @@ termino = st.text_input(
     label_visibility="collapsed",
 )
 
-# ---------------------------------------------------------------------------
-# 1) BUSQUEDA GENERAL: tiene prioridad sobre la navegación
-#    - Si reconoce sección y/o tipo (ej. "decreto", "ley aduanera") busca en
-#      todas las secciones que correspondan, una pestaña por sección.
-#    - Si no reconoce ninguno, se comporta como antes (detecta una fuente).
-# ---------------------------------------------------------------------------
 if termino.strip():
     secciones, tipos, resto = interpretar(termino)
 
@@ -399,9 +389,6 @@ if termino.strip():
         )
         mostrar_tabla(df_resultado, fuente, clave="tabla_busq_general")
 
-# ---------------------------------------------------------------------------
-# 2) VISTA DE SECCION (ej. Normativa Impositiva > Decretos)
-# ---------------------------------------------------------------------------
 elif st.session_state.seccion:
     seccion, tipo = st.session_state.seccion, st.session_state.tipo
     item = NAVEGACION[seccion]["items"][tipo]
@@ -410,9 +397,6 @@ elif st.session_state.seccion:
     st.subheader(f"{NAVEGACION[seccion]['icono']} {seccion} › {tipo}")
     mostrar_destino(seccion, tipo, item, "", con_titulo=False, clave="sec")
 
-# ---------------------------------------------------------------------------
-# 3) PANTALLA DE INICIO
-# ---------------------------------------------------------------------------
 else:
     col_imp, col_adu = st.columns(2, gap="large")
 
@@ -424,8 +408,11 @@ else:
                 f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
                 unsafe_allow_html=True,
             )
-            items_normales = {t: i for t, i in datos["items"].items() if "logo" not in i}
-            items_biblioteca = {t: i for t, i in datos["items"].items() if "logo" in i}
+            items_normales = {
+                t: i for t, i in datos["items"].items()
+                if "logo" not in i and "filtro_fijo" not in i
+            }
+            items_logo = {t: i for t, i in datos["items"].items() if "logo" in i}
 
             botones = st.columns(2)
             for i, (tipo, item) in enumerate(items_normales.items()):
@@ -440,29 +427,26 @@ else:
                     width="stretch",
                 )
 
-            if items_biblioteca:
-                st.caption("Biblioteca Aduanera ")
+            # Biblioteca donde cada tarjeta de color e imagen es directamente el enlace/botón de acceso
+            if items_logo:
+                st.caption("Biblioteca")
                 columnas_logo = st.columns(4)
-                for i, (tipo, item) in enumerate(items_biblioteca.items()):
+                for i, (tipo, item) in enumerate(items_logo.items()):
                     with columnas_logo[i % 4]:
-                        color_fondo = item.get("color", "")
-                        if color_fondo:
-                            st.markdown(
-                                f"""
-                                <div style="background-color: {color_fondo}; padding: 16px; border-radius: 8px; text-align: center; margin-bottom: 6px; display: flex; align-items: center; justify-content: center; height: 75px;">
-                                    <img src="{item['logo']}" style="max-height: 45px; max-width: 100%; object-fit: contain;">
+                        color_fondo = item.get("color", "#1e293b")
+                        url_destino = f"?sec={urllib.parse.quote(nombre)}&tip={urllib.parse.quote(tipo)}"
+                        
+                        st.markdown(
+                            f"""
+                            <a href="{url_destino}" target="_self" style="text-decoration: none;">
+                                <div style="background-color: {color_fondo}; padding: 12px; border-radius: 8px; 
+                                text-align: center; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; height: 65px; transition: filter 0.2s ease;"
+                                onmouseover="this.style.filter='brightness(1.15)'" onmouseout="this.style.filter='brightness(1)'" title="{tipo}">
+                                    <img src="{item['logo']}" style="max-height: 40px; max-width: 100%; object-fit: contain;">
                                 </div>
-                                """,
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            st.image(item["logo"], width=90)
-                        st.button(
-                            tipo,
-                            key=f"btn_{nombre}_{tipo}",
-                            on_click=ir_a,
-                            args=(nombre, tipo),
-                            width="stretch",
+                            </a>
+                            """,
+                            unsafe_allow_html=True,
                         )
 
     datos = NAVEGACION["Cotizaciones"]
