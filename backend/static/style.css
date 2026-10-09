@@ -14,7 +14,7 @@ body {
 /* Estilos de la pantalla de inicialización */
 .pantalla-inicio {
   text-align: center;
-  margin-bottom: 30px;
+  margin-bottom: 20px;
 }
 
 .logo-institucion {
@@ -108,3 +108,4 @@ th {
 tbody tr:hover {
   background: #f8faff;
 }
+
