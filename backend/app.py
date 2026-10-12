@@ -12,6 +12,7 @@ import difflib
 import re
 import unicodedata
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import pandas as pd
@@ -47,6 +48,19 @@ ITEMS_BIBLIOTECA_IMP = {
 ITEMS_BIBLIOTECA_ADU = {
     cat["nombre"]: {"icono": "📖", "fuente": cat["fuente"], "prefijo": None, "logo": cat["logo"],"color": cat.get("color","")}
     for cat in BIBLIOTECA_ADUANERA
+}
+
+# Instructivos institucionales: no están en FUENTES (se extraen aparte con
+# cargar_instructivos), pero deben poder buscarse igual que el resto.
+FUENTES_INSTRUCTIVOS = {
+    "dnit_instructivos_imp": (
+        "https://www.dnit.gov.py/en/web/portal-institucional/instructivos",
+        "Instructivos Impositivos",
+    ),
+    "dnit_instructivos_adu": (
+        "https://www.dnit.gov.py/en/web/portal-institucional/instructivos1",
+        "Instructivos Aduaneros",
+    ),
 }
 
 NAVEGACION = {
@@ -321,6 +335,10 @@ def filtrar_df(df, texto: str):
 
 
 def obtener_df(item: dict, filtro: str):
+    if item["fuente"] in FUENTES_INSTRUCTIVOS:
+        url_instructivos, _ = FUENTES_INSTRUCTIVOS[item["fuente"]]
+        df = cargar_instructivos(url_instructivos)
+        return filtrar_df(df, filtro)
     df = cargar("", item["fuente"])
     if item["prefijo"] and "Título" in df.columns:
         df = df[
@@ -351,18 +369,8 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
         return
 
     # Instructivos institucionales separados por área: impositiva y aduanera.
-    fuentes_instructivos = {
-        "dnit_instructivos_imp": (
-            "https://www.dnit.gov.py/en/web/portal-institucional/instructivos",
-            "Instructivos Impositivos",
-        ),
-        "dnit_instructivos_adu": (
-            "https://www.dnit.gov.py/en/web/portal-institucional/instructivos1",
-            "Instructivos Aduaneros",
-        ),
-    }
-    if item["fuente"] in fuentes_instructivos:
-        url_instructivos, titulo_instructivos = fuentes_instructivos[item["fuente"]]
+    if item["fuente"] in FUENTES_INSTRUCTIVOS:
+        url_instructivos, titulo_instructivos = FUENTES_INSTRUCTIVOS[item["fuente"]]
         st.markdown(f"### 📘 {titulo_instructivos}")
         st.caption(f"Listado extraído de la página oficial de la DNIT · {url_instructivos}")
         col_buscar, col_orden = st.columns([3, 1])
@@ -593,6 +601,35 @@ def destinos(secciones: list, tipos: list):
     return salida
 
 
+def destinos_con_resultados(secciones: list, tipos: list, filtro_texto: str):
+    """Recorre en paralelo todos los apartados candidatos (los indicados por
+    alias, o TODOS si no se reconoció ninguno) y devuelve solo los que
+    realmente tienen coincidencias para filtro_texto. Así el buscador
+    general ya no se limita a las palabras clave de cada sección: cualquier
+    texto libre ("relativa a la...") se busca en cada apartado."""
+    candidatos = [
+        (seccion, tipo, item)
+        for seccion, tipo, item in destinos(secciones, tipos)
+        if item["fuente"] is not None
+    ]
+
+    def probar(candidato):
+        _, _, item = candidato
+        try:
+            df = obtener_df(item, filtro_texto)
+        except Exception:
+            df = pd.DataFrame()
+        return candidato, not df.empty
+
+    encontrados = []
+    if candidatos:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for candidato, tiene_resultados in pool.map(probar, candidatos):
+                if tiene_resultados:
+                    encontrados.append(candidato)
+    return encontrados
+
+
 # ---------------------------------------------------------------------------
 # ESTILOS (Actualizados con los colores institucionales de la DNIT)
 # ---------------------------------------------------------------------------
@@ -616,6 +653,8 @@ st.markdown(
       .tarjeta-desc { color: #64748b; font-size: 0.84rem; margin: 0.15rem 0 0.45rem 0; }
       div[data-testid="stVerticalBlock"] { gap: 0.55rem; }
       div.stButton > button { padding-top: 0.35rem; padding-bottom: 0.35rem; }
+      section[data-testid="stSidebar"] div[data-testid="stExpander"] { margin-bottom: 0.4rem; }
+      section[data-testid="stSidebar"] div.stButton > button { text-align: left; justify-content: flex-start; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -637,22 +676,56 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-termino = st.text_input(
-    "Buscar",
-    key="termino_general",
-    placeholder="Escribe una palabra clave (ej: dnit, dolar, decreto, ley)...",
-    label_visibility="collapsed",
-)
+URL_MARANGATU = "https://marangatu.set.gov.py/eset/login"
+
+col_buscador, col_marangatu = st.columns([4, 1], gap="medium")
+with col_buscador:
+    termino = st.text_input(
+        "Buscar",
+        key="termino_general",
+        placeholder="Escribe una palabra clave (ej: dnit, dolar, decreto, ley)...",
+        label_visibility="collapsed",
+    )
+with col_marangatu:
+    st.markdown(
+        f"""
+        <a href="{URL_MARANGATU}" target="_blank" rel="noopener" style="text-decoration: none;">
+            <div style="background: #0e1830; border: 1px solid #223150; border-radius: 10px;
+            padding: 6px 14px; height: 44px; display: flex; align-items: center; justify-content: center;
+            gap: 10px; transition: filter 0.2s ease;"
+            onmouseover="this.style.filter='brightness(1.2)'" onmouseout="this.style.filter='brightness(1)'"
+            title="Ingresar a Marangatu">
+                <svg width="22" height="22" viewBox="0 0 100 100" fill="none" stroke="#8bc34a" stroke-width="3" aria-hidden="true">
+                    <circle cx="50" cy="28" r="20"/><circle cx="50" cy="72" r="20"/>
+                    <circle cx="31" cy="39" r="20"/><circle cx="69" cy="39" r="20"/>
+                    <circle cx="31" cy="61" r="20"/><circle cx="69" cy="61" r="20"/>
+                </svg>
+                <span style="color: #e7ebf3; font-size: 0.9rem; font-weight: 600; white-space: nowrap;">Ingresar a Marangatu</span>
+            </div>
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
 
 if termino.strip():
+    # secciones/tipos: solo restringen la búsqueda si el usuario escribió un
+    # alias reconocido (p. ej. "decreto", "aduanera"). Si no reconoce nada,
+    # ambas listas quedan vacías y destinos_con_resultados recorre TODO.
     secciones, tipos, resto = interpretar(termino)
 
-    if secciones or tipos:
+    with st.spinner(f"Buscando «{termino}» en los apartados relevantes..."):
+        coincidencias = destinos_con_resultados(secciones, tipos, resto)
+
+    if coincidencias:
         por_seccion = {}
-        for seccion, tipo, item in destinos(secciones, tipos):
+        for seccion, tipo, item in coincidencias:
             por_seccion.setdefault(seccion, []).append((tipo, item))
 
-        st.caption("Borra el texto del buscador para volver al inicio.")
+        total = sum(len(lista) for lista in por_seccion.values())
+        st.caption(
+            f"{total} apartado(s) con coincidencias en {len(por_seccion)} sección(es)."
+            "  ·  Borra el texto del buscador para volver al inicio."
+        )
 
         def pintar(seccion, lista):
             for tipo, item in lista:
@@ -660,7 +733,7 @@ if termino.strip():
 
         if len(por_seccion) > 1:
             pestanias = st.tabs(
-                [f"{NAVEGACION[sec]['icono']} {sec}" for sec in por_seccion]
+                [f"{NAVEGACION[sec]['icono']} {sec} ({len(lista)})" for sec, lista in por_seccion.items()]
             )
             for pestania, (seccion, lista) in zip(pestanias, por_seccion.items()):
                 with pestania:
@@ -670,23 +743,85 @@ if termino.strip():
                 st.subheader(f"{NAVEGACION[seccion]['icono']} {seccion}")
                 pintar(seccion, lista)
     else:
-        with st.spinner("Procesando consulta y extrayendo datos..."):
-            fuente, df_resultado = ejecutar_busqueda(termino)
-        filtro_local = st.text_input(
-            "Filtrar dentro de los resultados",
-            key="filtro_busq_general",
-            placeholder="Número, año, palabra clave...",
+        st.warning(
+            f"No se encontraron resultados para «{termino}» en ninguna sección "
+            "(Normativa Impositiva, Normativa Aduanera ni sus bibliotecas)."
         )
-        df_resultado = filtrar_df(df_resultado, filtro_local)
-        st.caption(
-            f"Fuente: {fuente['nombre']} ({len(df_resultado)} filas) - {fuente['url']}  ·  "
-            "Borra el texto del buscador para volver al inicio."
-        )
-        mostrar_tabla(df_resultado, fuente, clave="tabla_busq_general")
+        st.caption("Borra el texto del buscador para volver al inicio.")
 
 else:
-    # Si se eligió una categoría, mostrar primero los resultados: evita que
-    # queden debajo de todo el catálogo de opciones.
+    # -----------------------------------------------------------------
+    # BARRA LATERAL DE NAVEGACION (v2): las categorías ya no están en
+    # botones centrales, sino agrupadas por sección en el sidebar.
+    # -----------------------------------------------------------------
+    with st.sidebar:
+        st.markdown("###### 📂 Menú de navegación")
+        for nombre in ("Normativa Impositiva", "Normativa Aduanera"):
+            datos = NAVEGACION[nombre]
+            items_normales = {
+                t: i for t, i in datos["items"].items()
+                if "logo" not in i and "filtro_fijo" not in i
+            }
+            seccion_activa = st.session_state.seccion == nombre
+            with st.expander(f"{datos['icono']} {nombre}", expanded=True):
+                for tipo, item in items_normales.items():
+                    etiqueta = f"{item['icono']} {tipo}"
+                    if item["fuente"] is None:
+                        etiqueta += " (próximamente)"
+                    activo = seccion_activa and st.session_state.tipo == tipo
+                    st.button(
+                        etiqueta,
+                        key=f"nav_{nombre}_{tipo}",
+                        on_click=ir_a,
+                        args=(nombre, tipo),
+                        width="stretch",
+                        type="primary" if activo else "secondary",
+                    )
+        st.markdown("---")
+        activo_cot = st.session_state.seccion == "Cotizaciones"
+        st.button(
+            "💱 Cotizaciones",
+            key="nav_cotizaciones",
+            on_click=ir_a,
+            args=("Cotizaciones", "Historial"),
+            width="stretch",
+            type="primary" if activo_cot else "secondary",
+        )
+
+    # -----------------------------------------------------------------
+    # BIBLIOTECA: se mantiene debajo del buscador general (en la
+    # pantalla principal) para acceso directo, agrupada por sección.
+    # -----------------------------------------------------------------
+    for nombre in ("Normativa Impositiva", "Normativa Aduanera"):
+        datos = NAVEGACION[nombre]
+        items_logo = {t: i for t, i in datos["items"].items() if "logo" in i}
+        if not items_logo:
+            continue
+        st.caption(f"Biblioteca · {nombre}")
+        columnas_logo = st.columns(4)
+        for i, (tipo, item) in enumerate(items_logo.items()):
+            with columnas_logo[i % 4]:
+                color_fondo = item.get("color", "#1e293b")
+                url_destino = f"?sec={urllib.parse.quote(nombre)}&tip={urllib.parse.quote(tipo)}"
+
+                st.markdown(
+                    f"""
+                    <a href="{url_destino}" target="_self" style="text-decoration: none;">
+                        <div style="background-color: {color_fondo}; padding: 12px; border-radius: 8px; 
+                        text-align: center; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; height: 65px; transition: filter 0.2s ease;"
+                        onmouseover="this.style.filter='brightness(1.15)'" onmouseout="this.style.filter='brightness(1)'" title="{tipo}">
+                            <img src="{item['logo']}" style="max-height: 40px; max-width: 100%; object-fit: contain;">
+                        </div>
+                    </a>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------------------
+    # RESULTADOS de la sección/tipo elegidos en el sidebar
+    # -----------------------------------------------------------------
     if st.session_state.seccion and st.session_state.tipo:
         seccion, tipo = st.session_state.seccion, st.session_state.tipo
         item = NAVEGACION[seccion]["items"][tipo]
@@ -696,68 +831,5 @@ else:
         with col_accion:
             st.button("✖ Limpiar", on_click=volver_inicio, width="stretch")
         mostrar_destino(seccion, tipo, item, "", con_titulo=False, clave="sec")
-        st.markdown("---")
-
-    col_imp, col_adu = st.columns(2, gap="large")
-
-    for columna, nombre in ((col_imp, "Normativa Impositiva"), (col_adu, "Normativa Aduanera")):
-        datos = NAVEGACION[nombre]
-        with columna, st.container(border=True):
-            st.markdown(
-                f"<p class='tarjeta-titulo'>{datos['icono']} {nombre}</p>"
-                f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
-                unsafe_allow_html=True,
-            )
-            items_normales = {
-                t: i for t, i in datos["items"].items()
-                if "logo" not in i and "filtro_fijo" not in i
-            }
-            items_logo = {t: i for t, i in datos["items"].items() if "logo" in i}
-
-            botones = st.columns(2)
-            for i, (tipo, item) in enumerate(items_normales.items()):
-                etiqueta = f"{item['icono']} {tipo}"
-                if item["fuente"] is None:
-                    etiqueta += " (próximamente)"
-                botones[i % 2].button(
-                    etiqueta,
-                    key=f"btn_{nombre}_{tipo}",
-                    on_click=ir_a,
-                    args=(nombre, tipo),
-                    width="stretch",
-                )
-# Biblioteca donde cada tarjeta de color e imagen es directamente el enlace/botón de acceso
-            if items_logo:
-                st.caption("Biblioteca")
-                columnas_logo = st.columns(4)
-                for i, (tipo, item) in enumerate(items_logo.items()):
-                    with columnas_logo[i % 4]:
-                        color_fondo = item.get("color", "#1e293b")
-                        url_destino = f"?sec={urllib.parse.quote(nombre)}&tip={urllib.parse.quote(tipo)}"
-                        
-                        st.markdown(
-                            f"""
-                            <a href="{url_destino}" target="_self" style="text-decoration: none;">
-                                <div style="background-color: {color_fondo}; padding: 12px; border-radius: 8px; 
-                                text-align: center; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; height: 65px; transition: filter 0.2s ease;"
-                                onmouseover="this.style.filter='brightness(1.15)'" onmouseout="this.style.filter='brightness(1)'" title="{tipo}">
-                                    <img src="{item['logo']}" style="max-height: 40px; max-width: 100%; object-fit: contain;">
-                                </div>
-                            </a>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-    datos = NAVEGACION["Cotizaciones"]
-    with st.container(border=True):
-        st.markdown(
-            f"<p class='tarjeta-titulo'>{datos['icono']} Cotizaciones</p>"
-            f"<p class='tarjeta-desc'>{datos['descripcion']}</p>",
-            unsafe_allow_html=True,
-        )
-        st.button(
-            "📈 Ver historial de cotizaciones",
-            key="btn_cotizaciones",
-            on_click=ir_a,
-            args=("Cotizaciones", "Historial"),
-        )
+    else:
+        st.info("Selecciona una opción del menú lateral (izquierda) para ver los resultados aquí.")
