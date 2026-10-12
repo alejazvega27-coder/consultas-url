@@ -27,9 +27,8 @@ from scraper import (
     obtener_fuente,
 )
 
-st.set_page_config(layout="wide", page_title="Buscador DNIT")
-
 LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download=true"
+st.set_page_config(layout="wide", page_title="Buscador DNIT", page_icon=LOGO_URL)
 
 # Sincronizar parámetros de URL para permitir clics directos en los iconos
 if "sec" in st.query_params:
