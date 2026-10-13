@@ -23,14 +23,20 @@ from scraper import (
     BIBLIOTECA_ADUANERA,
     descargar_archivo,
     ejecutar_busqueda,
+    diagnosticar_pagina,
+    extraer_tablas,
     nombre_archivo,
     obtener_fuente,
+    obtener_html,
+    parser_instructivos,
 )
 
 LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download=true"
 st.set_page_config(layout="wide", page_title="Buscador DNIT", page_icon=LOGO_URL)
 
 # Sincronizar parámetros de URL para permitir clics directos en los iconos
+if "sec" in st.query_params and "seccion" not in st.session_state:
+    st.session_state.scroll_resultados = True   # enlace directo: baja a los resultados
 if "sec" in st.query_params:
     st.session_state.seccion = st.query_params["sec"]
 if "tip" in st.query_params:
@@ -84,6 +90,8 @@ NAVEGACION = {
             "Resoluciones": {"icono": "📑", "fuente": "dnit_resoluciones_adu", "prefijo": None},
             "Digesto":      {"icono": "📚", "fuente": "digesto_aduanero",    "prefijo": None},
             "Instructivos": {"icono": "📘", "fuente": "dnit_instructivos_adu", "prefijo": None},
+            "Dictámenes":   {"icono": "🗂️", "fuente": "dnit_dictamenes_adu",   "prefijo": None, "tablas": True},
+            "VII Enmienda": {"icono": "🔢", "fuente": "dnit_enmienda_vii",     "prefijo": None, "tablas": True},
             **ITEMS_BIBLIOTECA_ADU,
         },
     },
@@ -121,12 +129,36 @@ st.session_state.setdefault("modal_pvaa_titulo", None)
 def ir_a(seccion: str, tipo: str):
     st.session_state.seccion = seccion
     st.session_state.tipo = tipo
+    st.query_params["sec"] = seccion
+    st.query_params["tip"] = tipo
+    st.session_state.scroll_resultados = True   # tras el clic, deslizar a "Resultados"
 
 
 def volver_inicio():
     st.session_state.seccion = None
     st.session_state.tipo = None
     st.query_params.clear()
+
+
+def limpiar_todo():
+    """Botón Limpiar del buscador general: borra el texto y vuelve al inicio (sin Enter)."""
+    st.session_state.termino_general = ""
+    volver_inicio()
+
+
+def scroll_a_resultados():
+    """Desliza la página hasta el contenedor de resultados (una sola vez por clic)."""
+    if not st.session_state.pop("scroll_resultados", False):
+        return
+    st.components.v1.html(
+        """<script>
+        setTimeout(function () {
+          var el = window.parent.document.querySelector('.st-key-resultados');
+          if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }
+        }, 250);
+        </script>""",
+        height=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -140,73 +172,82 @@ def cargar(termino: str, fuente_id: str | None):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cargar_instructivos(url: str):
-    """Extrae las filas de la página oficial de instructivos para mostrarlas como tabla."""
-    respuesta = requests.get(
-        url,
-        timeout=25,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; BuscadorDNIT/1.0)"},
-    )
-    respuesta.raise_for_status()
-    soup = BeautifulSoup(respuesta.text, "html.parser")
-    registros = []
-    vistos = set()
+    """Instructivos con título y descripción de cada apartado (ver scraper.parser_instructivos)."""
+    return parser_instructivos(obtener_html(url), url)
 
-    # Primero se leen las tablas que publica el portal, conservando encabezados y filas.
-    for tabla in soup.select("table"):
-        filas = tabla.select("tr")
-        if not filas:
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cargar_html(url: str) -> str:
+    return obtener_html(url)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cargar_presentacion_biblioteca(url: str):
+    """Extrae una descripción introductoria y accesos a sistemas desde la fuente oficial."""
+    html = obtener_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+    for nodo in soup(["script", "style", "noscript", "nav", "footer"]):
+        nodo.decompose()
+
+    zona = soup.select_one("main, #main-content, [role='main'], #content") or soup
+    descripcion = []
+    for p in zona.find_all(["p", "blockquote"]):
+        texto = " ".join(p.get_text(" ", strip=True).split())
+        if len(texto) < 45 or len(texto) > 650:
             continue
-        encabezados = [" ".join(c.get_text(" ", strip=True).split()) for c in filas[0].select("th,td")]
-        for fila in filas[1:] if any(filas[0].select("th")) else filas:
-            celdas = fila.select("th,td")
-            if not celdas:
-                continue
-            textos = [" ".join(c.get_text(" ", strip=True).split()) for c in celdas]
-            anclas = fila.select("a[href]")
-            if not any(textos) and not anclas:
-                continue
-            enlace = anclas[0] if anclas else None
-            titulo = " ".join(enlace.get_text(" ", strip=True).split()) if enlace else (textos[0] if textos else "")
-            href = urllib.parse.urljoin(url, enlace.get("href", "")) if enlace else ""
-            if not titulo and textos:
-                titulo = " | ".join(t for t in textos if t)
-            if not titulo:
-                continue
-            fecha = ""
-            descripcion = ""
-            for i, valor in enumerate(textos):
-                if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b(?:19|20)\d{2}\b", valor):
-                    fecha = valor
-                elif valor and valor != titulo and valor not in encabezados:
-                    descripcion = valor if not descripcion else f"{descripcion} · {valor}"
-            clave = (titulo, href)
-            if clave not in vistos:
-                vistos.add(clave)
-                registros.append({"Sección": "Instructivos", "Fecha": fecha, "Título": titulo,
-                                  "Descripción": descripcion, "Enlace Descargar": href,
-                                  "Enlace Ver": href or url})
+        if texto not in descripcion:
+            descripcion.append(texto)
+        if len(descripcion) >= 3:
+            break
 
-    # Algunos listados de Liferay no usan <table>; se extraen enlaces de la zona de contenido.
-    if not registros:
-        contenido = soup.select_one("main") or soup.select_one(".portlet-body") or soup.body or soup
-        for a in contenido.select("a[href]"):
-            titulo = " ".join(a.get_text(" ", strip=True).split())
-            href = urllib.parse.urljoin(url, a.get("href", ""))
-            if not titulo or len(titulo) < 3 or href.startswith(("javascript:", "mailto:", "#")):
-                continue
-            texto_norm = normalizar(titulo + " " + href)
-            # Evitar enlaces de navegación genéricos y priorizar instructivos/documentos.
-            if not any(p in texto_norm for p in ("instructivo", "formulario", "guia", "manual", ".pdf", ".doc", ".xls", "descargar", "ver archivo")):
-                continue
-            clave = (titulo, href)
-            if clave in vistos:
-                continue
-            vistos.add(clave)
-            registros.append({"Sección": "Instructivos", "Fecha": "", "Título": titulo,
-                              "Descripción": "", "Enlace Descargar": href,
-                              "Enlace Ver": href})
+    accesos, vistos = [], set()
+    palabras_acceso = (
+        "consulta", "sistema", "acceder", "ingresar", "solicitud",
+        "registro", "tramite", "trámite", "portal", "aplicacion",
+        "aplicación", "servicio en linea", "servicio en línea", "reenvio", "reenvío"
+    )
+    for a in zona.select("a[href]"):
+        titulo = " ".join(a.get_text(" ", strip=True).split())
+        href = urllib.parse.urljoin(url, (a.get("href") or "").strip())
+        if not titulo or len(titulo) < 4 or href.startswith(("javascript:", "mailto:", "#")):
+            continue
+        if any(ext in urllib.parse.urlparse(href).path.lower() for ext in
+               (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".png", ".jpg", ".svg")):
+            continue
+        if not any(p in normalizar(titulo) for p in palabras_acceso):
+            continue
+        if href.rstrip("/") == url.rstrip("/") or href in vistos:
+            continue
+        vistos.add(href)
+        accesos.append({"titulo": titulo, "url": href})
+        if len(accesos) >= 8:
+            break
+    return descripcion, accesos
 
-    return pd.DataFrame(registros, columns=["Sección", "Fecha", "Título", "Descripción", "Enlace Descargar", "Enlace Ver"])
+
+MUESTRAS_DIAGNOSTICO = {
+    "dnit_dictamenes_adu": ["Congeladoras conservadoras para helados"],
+    "dnit_enmienda_vii": ["0305.10.00"],
+}
+
+
+def mostrar_diagnostico(url: str, clave: str, muestras=()):
+    """Panel para ver qué trae realmente la página (y poder compartir el HTML)."""
+    with st.expander("🛠 Diagnóstico de la página", expanded=False):
+        try:
+            html = cargar_html(url)
+        except (requests.RequestException, ValueError) as e:
+            st.error(f"No se pudo descargar la página: {e}")
+            return
+        st.json(diagnosticar_pagina(html, url, muestras))
+        st.download_button("⬇ Descargar HTML recibido", html, file_name="pagina_dnit.html",
+                           mime="text/html", key=f"diag_{clave}")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cargar_tablas(url: str):
+    """Todas las tablas <table> que contiene una página: [(titulo, DataFrame), ...]."""
+    return extraer_tablas(obtener_html(url), url)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -280,8 +321,9 @@ def mostrar_tabla(df, fuente, clave: str = "tabla"):
         return
 
     opciones = {"width": "stretch", "hide_index": True}
-    if "Enlace Ver" in df.columns:
-        opciones["column_config"] = COLUMN_CONFIG_NORMAS
+    config = {k: v for k, v in COLUMN_CONFIG_NORMAS.items() if k in df.columns}
+    if config:
+        opciones["column_config"] = config
 
     if "Enlace Descargar" not in df.columns:
         st.dataframe(df, **opciones)
@@ -295,6 +337,50 @@ def mostrar_tabla(df, fuente, clave: str = "tabla"):
         panel_descarga(df.iloc[filas[0]], clave)
     else:
         st.caption("💡 Selecciona una fila (casilla de la izquierda) para descargar su archivo.")
+
+
+def aplicar_filtros_columnas(df, clave: str, max_opciones: int = 80):
+    """Filtros de selección (multiselect) por cada columna con pocos valores distintos."""
+    if df.empty:
+        return df
+    columnas = []
+    for c in df.columns:
+        if str(c).startswith("Enlace"):
+            continue
+        valores = [v for v in df[c].astype(str).unique() if v.strip()]
+        if 1 < len(valores) <= max_opciones:
+            columnas.append((c, sorted(valores, key=lambda v: normalizar(v))))
+    if not columnas:
+        return df
+    base = df
+    with st.expander("🔎 Filtros por columna", expanded=False):
+        celdas = st.columns(min(3, len(columnas)))
+        for i, (c, opciones) in enumerate(columnas):
+            with celdas[i % len(celdas)]:
+                elegidos = st.multiselect(str(c), opciones, key=f"{clave}_col_{c}")
+            if elegidos:
+                df = df[base[c].astype(str).isin(elegidos)]
+    return df.reset_index(drop=True)
+
+
+def mostrar_tablas_pagina(url: str, clave: str):
+    """Muestra las tablas de la página oficial, cada una con filtro de texto y por columna."""
+    try:
+        tablas = cargar_tablas(url)
+    except (requests.RequestException, ValueError):
+        return
+    if not tablas:
+        return
+    st.markdown(f"#### 📊 Tablas de la página ({len(tablas)})")
+    for i, (titulo, tabla) in enumerate(tablas):
+        etiqueta = f"{titulo or f'Tabla {i + 1}'} · {len(tabla)} filas"
+        with st.expander(etiqueta, expanded=(len(tablas) == 1)):
+            texto = st.text_input("Filtrar esta tabla", key=f"{clave}_t{i}_txt",
+                                  placeholder="Palabra clave...")
+            vista = aplicar_filtros_columnas(tabla, f"{clave}_t{i}")
+            vista = filtrar_df(vista, texto)
+            st.caption(f"{len(vista)} de {len(tabla)} filas")
+            mostrar_tabla(vista, None, clave=f"{clave}_t{i}")
 
 
 def normalizar(texto: str) -> str:
@@ -358,6 +444,250 @@ def mostrar_modal_pvaa(titulo: str, url: str):
         st.session_state["modal_pvaa_titulo"] = None
         st.rerun()
 
+def mostrar_tabla_fuente(item: dict, filtro_base: str, clave: str, selects=(), textos=(),
+                         col_fecha: str = None, anchos: dict = None, detalle: bool = False,
+                         nota: str = ""):
+    """Muestra la tabla de la página DNIT tal cual la publica, con filtros:
+    búsqueda libre, selección múltiple por columna, 'contiene' por columna y orden por fecha."""
+    fuente = obtener_fuente(item["fuente"])
+    with st.spinner("Extrayendo datos..."):
+        try:
+            df = obtener_df(item, filtro_base)
+        except (requests.RequestException, ValueError) as e:
+            st.error(f"No se pudo descargar la página: {e}")
+            df = pd.DataFrame()
+    if df.empty:
+        st.warning("No se pudo leer la tabla de la página. Revisa el diagnóstico de abajo.")
+        mostrar_diagnostico(fuente["url"], clave, MUESTRAS_DIAGNOSTICO.get(item["fuente"], ()))
+        return
+
+    total = len(df)
+    if nota:
+        st.caption(nota)
+    texto = st.text_input("Buscar en la tabla", key=f"tf_txt_{clave}",
+                          placeholder="Palabra clave en cualquier columna...")
+    df = filtrar_df(df, texto)
+
+    controles = [("sel", c) for c in selects if c in df.columns] + \
+                [("txt", c) for c in textos if c in df.columns]
+    if col_fecha and col_fecha in df.columns:
+        controles.append(("ord", col_fecha))
+    orden = "Como en la fuente"
+    base = df
+    for inicio in range(0, len(controles), 4):
+        celdas = st.columns(4)
+        for celda, (tipo_ctl, col) in zip(celdas, controles[inicio:inicio + 4]):
+            with celda:
+                if tipo_ctl == "sel":
+                    valores = sorted({v for v in base[col].astype(str) if v.strip()},
+                                     key=lambda v: (not v.isdigit(), -int(v) if v.isdigit() else 0, normalizar(v)))
+                    elegidos = st.multiselect(col, valores, key=f"tf_sel_{clave}_{col}")
+                    if elegidos:
+                        df = df[df[col].astype(str).isin(elegidos)]
+                elif tipo_ctl == "txt":
+                    valor = st.text_input(f"{col} contiene", key=f"tf_txt_{clave}_{col}")
+                    if valor.strip():
+                        buscado = normalizar(valor)
+                        df = df[df[col].astype(str).map(normalizar).str.contains(buscado, regex=False)]
+                else:
+                    orden = st.selectbox(f"Orden por {col.lower()}",
+                                         ["Como en la fuente", "Más reciente primero", "Más antiguo primero"],
+                                         key=f"tf_ord_{clave}")
+    if orden != "Como en la fuente":
+        fechas = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce")
+        df = df.assign(_f=fechas).sort_values(
+            "_f", ascending=(orden == "Más antiguo primero"), na_position="last", kind="stable"
+        ).drop(columns="_f")
+    df = df.reset_index(drop=True)
+
+    st.caption(f"Fuente: {fuente['nombre']} ({len(df)} de {total} filas) - {fuente['url']}")
+    if df.empty:
+        st.warning("Ninguna fila cumple los filtros elegidos.")
+        return
+
+    config = {k: v for k, v in COLUMN_CONFIG_NORMAS.items() if k in df.columns}
+    for col, ancho in (anchos or {}).items():
+        if col in df.columns:
+            config[col] = st.column_config.TextColumn(col, width=ancho)
+    opciones = {"width": "stretch", "hide_index": True, "column_config": config}
+    if detalle:
+        evento = st.dataframe(df, key=f"tf_df_{clave}", on_select="rerun",
+                              selection_mode="single-row", **opciones)
+        filas = evento.selection.rows
+        if filas and filas[0] < len(df):
+            fila = df.iloc[filas[0]]
+            with st.container(border=True):
+                st.markdown("**Detalle de la fila seleccionada**")
+                for col in df.columns:
+                    if str(fila[col]).strip() and not str(col).startswith("Enlace"):
+                        st.markdown(f"**{col}:** {fila[col]}")
+                if "Enlace Descargar" in df.columns:
+                    panel_descarga(fila, f"tf_{clave}")
+        else:
+            st.caption("💡 Selecciona una fila (casilla de la izquierda) para ver su detalle completo.")
+    else:
+        st.dataframe(df, **opciones)
+    st.download_button("⬇ Descargar CSV (filas filtradas)", df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{item['fuente']}.csv", mime="text/csv", key=f"tf_csv_{clave}")
+    mostrar_diagnostico(fuente["url"], clave, MUESTRAS_DIAGNOSTICO.get(item["fuente"], ()))
+
+
+MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
+         "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+MONEDAS_COT = ["DOLAR", "REAL", "PESO_ARG", "YEN", "EURO", "LIBRA"]
+
+
+def filtrar_cotizaciones(df, texto="", anio="Todos", mes="Todos", campo=None,
+                         vmin=None, vmax=None, descendente=True, monedas=None):
+    """Filtra y ordena el historial de cotizaciones (función pura, sin widgets)."""
+    if df.empty:
+        return df
+    df = filtrar_df(df, texto)
+    fechas = pd.to_datetime(df["fecha"], errors="coerce")
+    mascara = pd.Series(True, index=df.index)
+    if anio != "Todos":
+        mascara &= fechas.dt.year == int(anio)
+    if mes != "Todos":
+        mascara &= fechas.dt.month == MESES.index(mes) + 1
+    if campo and campo in df.columns:
+        if vmin is not None:
+            mascara &= df[campo] >= vmin
+        if vmax is not None:
+            mascara &= df[campo] <= vmax
+    df = df[mascara].assign(_f=fechas[mascara]).sort_values("_f", ascending=not descendente)
+    df = df.drop(columns="_f").reset_index(drop=True)
+    if monedas is not None:
+        df = df[["fecha"] + [c for c in df.columns if c != "fecha" and c.rsplit("_", 1)[0] in monedas]]
+    return df
+
+
+def mostrar_cotizaciones(filtro_base: str, clave: str):
+    with st.spinner("Extrayendo datos..."):
+        df = obtener_df({"fuente": "dnit_cotizaciones", "prefijo": None}, filtro_base)
+    if df.empty:
+        st.warning("No se encontraron cotizaciones.")
+        return
+
+    fechas = pd.to_datetime(df["fecha"], errors="coerce")
+    anios = [str(a) for a in sorted(fechas.dt.year.dropna().astype(int).unique(), reverse=True)]
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1.5])
+    with c1:
+        texto = st.text_input("Palabra clave o fecha", key=f"cot_txt_{clave}",
+                              placeholder="Ej: 2026-04, 7.5...")
+    with c2:
+        anio = st.selectbox("Año", ["Todos"] + anios, key=f"cot_anio_{clave}")
+    with c3:
+        mes = st.selectbox("Mes", ["Todos"] + MESES, key=f"cot_mes_{clave}")
+    with c4:
+        orden = st.selectbox("Orden por fecha", ["Más reciente primero", "Más antigua primero"],
+                             key=f"cot_orden_{clave}")
+
+    columnas_valor = [c for c in df.columns if c != "fecha"]
+    campo, vmin, vmax, monedas = None, None, None, None
+    with st.expander("🔎 Filtros por valor", expanded=False):
+        monedas = st.multiselect("Monedas a mostrar", MONEDAS_COT, default=MONEDAS_COT,
+                                 key=f"cot_mon_{clave}")
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            campo = st.selectbox("Columna a filtrar", ["(ninguna)"] + columnas_valor,
+                                 key=f"cot_campo_{clave}")
+        with f2:
+            vmin = st.number_input("Valor mínimo", value=None, format="%.2f",
+                                   key=f"cot_min_{clave}")
+        with f3:
+            vmax = st.number_input("Valor máximo", value=None, format="%.2f",
+                                   key=f"cot_max_{clave}")
+    if campo == "(ninguna)":
+        campo = None
+
+    vista = filtrar_cotizaciones(df, texto, anio, mes, campo, vmin, vmax,
+                                 descendente=(orden == "Más reciente primero"),
+                                 monedas=monedas)
+    fuente = obtener_fuente("dnit_cotizaciones")
+    st.caption(f"Fuente: {fuente['nombre']} ({len(vista)} de {len(df)} registros) - {fuente['url']}")
+    if vista.empty:
+        st.warning("Ninguna cotización cumple los filtros elegidos.")
+        return
+    config = {"fecha": st.column_config.TextColumn("Fecha", width="small")}
+    for c in vista.columns:
+        if c != "fecha":
+            config[c] = st.column_config.NumberColumn(c.replace("_", " "), format="%.2f")
+    st.dataframe(vista, width="stretch", hide_index=True, column_config=config)
+
+
+def mostrar_presentacion_biblioteca(item: dict, tipo: str, clave: str):
+    """Muestra una ficha institucional integrada, inspirada en la página oficial."""
+    fuente = obtener_fuente(item["fuente"])
+    if not fuente or not fuente.get("url"):
+        return
+    url_oficial = fuente["url"]
+    try:
+        descripcion, accesos = cargar_presentacion_biblioteca(url_oficial)
+    except (requests.RequestException, ValueError):
+        descripcion, accesos = [], []
+
+    # Ficha IVA: replica en Streamlit la jerarquía visual de la página institucional
+    # y mantiene la normativa/listados de la fuente debajo de esta presentación.
+    if normalizar(tipo) == "iva":
+        url_iva = "https://www.dnit.gov.py/en/web/portal-institucional/iva"
+        st.markdown("""
+        <style>
+        .iva-hero {background:linear-gradient(110deg,#1e7197,#258ec0);color:white;padding:28px 30px;border-radius:8px;margin:8px 0 24px 0;}
+        .iva-hero h2 {color:white!important;font-size:2.25rem;margin:0 0 14px 0;}
+        .iva-hero p {color:white!important;font-size:1rem;line-height:1.55;margin-bottom:0;}
+        .iva-registro {background:#1b5875;padding:22px 24px;border-radius:6px;color:white;height:100%;}
+        .iva-registro h4 {color:white!important;margin-top:0;}
+        .iva-registro p {color:white!important;}
+        .iva-seccion {color:#5790f0;font-size:1.55rem;font-weight:500;margin:12px 0 14px 0;}
+        .iva-caracteristicas {background:#090718;padding:14px 18px;color:#5790f0;border-radius:2px;margin-bottom:12px;}
+        .iva-dato {padding:3px 5px 10px 5px;}
+        </style>
+        """, unsafe_allow_html=True)
+        hero_a, hero_b = st.columns([1.05, 1], gap="large")
+        with hero_a:
+            st.markdown("<div class='iva-hero'><h2>IVA ▤</h2><p>El Impuesto al Valor Agregado (IVA) es un impuesto a las enajenaciones (compra/venta) de bienes situados en el país, las prestaciones de servicios realizadas en el territorio nacional (excluidos los prestados en relación de dependencia) y la importación de bienes.</p></div>", unsafe_allow_html=True)
+        with hero_b:
+            st.markdown("<div class='iva-hero iva-registro'><h4>Inscripción al IVA</h4><p>Si ya cumples con todos los requisitos para inscribirte al IVA puedes registrarte desde la página oficial de la DNIT.</p></div>", unsafe_allow_html=True)
+            st.link_button("📝 Inscribirme / consultar requisitos", url_iva, use_container_width=True)
+        st.markdown("<div class='iva-seccion'>Principales características</div>", unsafe_allow_html=True)
+        st.markdown("<div class='iva-caracteristicas'><b>Tipo de Impuesto:</b> Al Consumo &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Vencimiento:</b> Mensual<br><b>Tasas:</b> 5% y 10% &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Obligación:</b> 211 - IVA GENERAL</div>", unsafe_allow_html=True)
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            st.markdown("**Regímenes**  \nGeneral  \nRégimen de Turismo")
+            st.markdown("**Principales obligaciones**  \nEmitir comprobantes, comunicar la numeración utilizada, registrar comprobantes, presentar la declaración jurada y pagar los tributos.")
+        with c2:
+            st.markdown("**Obligados**  \nServicios personales fuera de relación de dependencia, alquileres, empresas unipersonales y privadas, sucursales y establecimientos permanentes, estructuras jurídicas transparentes, importadores, contribuyentes del INR y entidades públicas indicadas por la DNIT.")
+        st.link_button("🌐 Abrir ficha oficial completa del IVA", url_iva, use_container_width=True)
+        st.markdown("---")
+        st.markdown("#### 📚 Recursos oficiales relacionados")
+        st.caption("A continuación se muestran los documentos y las normativas que la aplicación consigue recuperar de la fuente institucional.")
+        return
+
+    with st.container(border=True):
+        st.markdown(f"#### ℹ️ ¿Qué encontrarás en {tipo}?")
+        if descripcion:
+            for parrafo in descripcion:
+                st.write(parrafo)
+        else:
+            st.write(
+                f"Esta sección reúne la información que la DNIT publica en la fuente oficial "
+                f"de **{fuente.get('nombre', tipo)}**. El listado que sigue se obtiene de esa página "
+                "y puede incluir documentos, normativas, guías u otros recursos según el contenido disponible."
+            )
+        st.caption(f"Fuente institucional: {url_oficial}")
+        if accesos:
+            st.markdown("**Accesos y servicios detectados en esta fuente**")
+            for i, acceso in enumerate(accesos):
+                with st.expander(f"🔗 {acceso['titulo']}", expanded=False):
+                    st.components.v1.iframe(acceso["url"], height=560, scrolling=True)
+                    st.link_button(
+                        "Abrir sistema en una pestaña nueva",
+                        acceso["url"],
+                        key=f"bib_acceso_{clave}_{i}",
+                        use_container_width=True,
+                    )
+
+
 def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
                     con_titulo: bool = True, clave: str = "sec"):
     if con_titulo:
@@ -366,6 +696,10 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
     if item["fuente"] is None:
         st.info(f"**{tipo}** de **{seccion}** todavía no tiene una fuente configurada (próximamente).")
         return
+
+    # No mostrar descripciones introductorias de cada biblioteca; mantener
+    # las tablas, documentos y accesos funcionales de cada sección.
+    tipo_normalizado = normalizar(tipo)
 
     # Instructivos institucionales separados por área: impositiva y aduanera.
     if item["fuente"] in FUENTES_INSTRUCTIVOS:
@@ -457,9 +791,35 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
                 st.info("No se pudieron detectar recursos individuales automáticamente. Consultá la página oficial.")
         except (requests.RequestException, ValueError) as error:
             st.warning(f"No se pudieron cargar los recursos automáticamente: {error}")
+        mostrar_tablas_pagina(url_pvaa, f"pg_{clave}_pvaa")
         st.link_button("🌐 Abrir página oficial de PVAA", url_pvaa, use_container_width=True)
         with st.expander("Vista integrada del portal oficial"):
             st.components.v1.iframe(url_pvaa, height=650, scrolling=True)
+        return
+
+    if item["fuente"] == "dnit_cotizaciones":
+        mostrar_cotizaciones(filtro_base, f"{clave}_{seccion}_{tipo}")
+        return
+
+    if item["fuente"] == "dnit_dictamenes_adu":
+        mostrar_tabla_fuente(
+            item, filtro_base, f"{clave}_{seccion}_{tipo}",
+            selects=("Año", "Resolución", "País", "Capítulo"),
+            textos=("Dictamen", "Mercadería", "Clasificación"),
+            col_fecha="Fecha", detalle=True,
+            anchos={"Dictamen": "medium", "Mercadería": "medium", "Descripción": "large",
+                    "Fundamento Legal": "medium"})
+        return
+
+    if item["fuente"] == "dnit_enmienda_vii":
+        mostrar_tabla_fuente(
+            item, filtro_base, f"{clave}_{seccion}_{tipo}",
+            selects=("Capítulo", "Correlación"),
+            textos=("NCM 2017 (VI Enmienda)", "NCM 2022 (VII Enmienda)"),
+            nota=("Tabla de correlación entre la NCM 2017 y la NCM 2022 (VII Enmienda). "
+                  "«EX» indica que la correlación no es plena: los códigos alcanzados "
+                  "corresponden a más de un ítem."),
+            anchos={"NCM 2017 (VI Enmienda)": "medium", "NCM 2022 (VII Enmienda)": "large"})
         return
 
     fuente = obtener_fuente(item["fuente"])
@@ -491,6 +851,8 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
             numero = int(sufijo)
             return str(2000 + numero if numero <= 29 else 1900 + numero)
         fecha = str(fila.get("Fecha", "") or "")
+        if item.get("tablas") and not fecha:
+            fecha = " ".join(str(v) for k, v in fila.items() if not str(k).startswith("Enlace"))
         completos_fecha = re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", fecha)
         return completos_fecha[-1] if completos_fecha else ""
 
@@ -514,9 +876,19 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
     if orden in ("Título A-Z", "Título Z-A") and "Título" in df.columns:
         df = df.sort_values("Título", ascending=(orden == "Título A-Z"), key=lambda col: col.astype(str).str.lower()).reset_index(drop=True)
 
+    if item.get("tablas"):
+        df = aplicar_filtros_columnas(df, f"colf_{clave}_{seccion}_{tipo}")
+
     detalle = f"  ·  Filtro del buscador: «{filtro_base}»" if filtro_base else ""
     st.caption(f"Fuente: {fuente['nombre']} ({len(df)} resultados) - {fuente['url']}{detalle}")
-    mostrar_tabla(df, fuente, clave=f"tabla_{clave}_{seccion}_{tipo}")
+    if df.empty and item.get("logo"):
+        st.caption("Sin documentos en el listado para este filtro (o la página no los publica como lista).")
+    else:
+        mostrar_tabla(df, fuente, clave=f"tabla_{clave}_{seccion}_{tipo}")
+    if item.get("logo"):
+        mostrar_tablas_pagina(fuente["url"], f"pg_{clave}_{seccion}_{tipo}")
+    if item.get("tablas"):
+        mostrar_diagnostico(fuente["url"], f"{clave}_{seccion}_{tipo}")
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +1001,29 @@ def destinos_con_resultados(secciones: list, tipos: list, filtro_texto: str):
     return encontrados
 
 
+def css_tarjeta_biblioteca(clave: str, logo: str, color: str, estado: str) -> str:
+    """Convierte un st.button en una tarjeta con logo; toda su superficie es clickeable."""
+    sel = f".st-key-{clave} button"
+    css = (
+        f"{sel}, {sel}:hover, {sel}:focus, {sel}:active {{"
+        f' background-color: {color} !important; background-image: url("{logo}") !important;'
+        " background-repeat: no-repeat !important; background-position: center !important;"
+        " background-size: contain !important; background-origin: content-box !important;"
+        " height: 65px !important; padding: 12px !important; color: transparent !important;"
+        " border: 3px solid transparent !important; transition: all 0.2s ease; }"
+        f" {sel} p {{ font-size: 0 !important; }}"
+        f" {sel}:hover {{ filter: brightness(1.15); }}"
+    )
+    if estado == "palida":
+        css += (f" {sel} {{ opacity: 0.3; filter: grayscale(0.6); }}"
+                f" {sel}:hover {{ opacity: 0.8; filter: none; }}")
+    elif estado == "activa":
+        css += (f" {sel}, {sel}:hover {{ border-color: #ffffff !important;"
+                " transform: translateY(-2px) scale(1.04);"
+                " box-shadow: 0 0 0 3px #2563eb, 0 8px 18px rgba(0,0,0,0.35); }")
+    return css
+
+
 # ---------------------------------------------------------------------------
 # ESTILOS (Actualizados con los colores institucionales de la DNIT)
 # ---------------------------------------------------------------------------
@@ -653,7 +1048,30 @@ st.markdown(
       div[data-testid="stVerticalBlock"] { gap: 0.55rem; }
       div.stButton > button { padding-top: 0.35rem; padding-bottom: 0.35rem; }
       section[data-testid="stSidebar"] div[data-testid="stExpander"] { margin-bottom: 0.4rem; }
-      section[data-testid="stSidebar"] div.stButton > button { text-align: left; justify-content: flex-start; }
+      /* Botones del menú lateral: texto alineado a la izquierda */
+      [data-testid="stSidebar"] [data-testid^="stBaseButton"],
+      section[data-testid="stSidebar"] div.stButton > button {
+        justify-content: flex-start !important; text-align: left !important;
+      }
+      [data-testid="stSidebar"] [data-testid^="stBaseButton"] > div,
+      [data-testid="stSidebar"] [data-testid^="stBaseButton"] [data-testid="stMarkdownContainer"],
+      [data-testid="stSidebar"] [data-testid^="stBaseButton"] p {
+        justify-content: flex-start !important; text-align: left !important; width: 100%;
+      }
+      /* Tarjetas de la biblioteca: la seleccionada resalta, el resto se ve más pálido */
+      .card-biblio {
+        padding: 12px; border-radius: 8px; height: 65px; margin-bottom: 10px;
+        display: flex; align-items: center; justify-content: center;
+        border: 3px solid transparent; transition: all 0.2s ease;
+      }
+      .card-biblio img { max-height: 40px; max-width: 100%; object-fit: contain; }
+      .card-biblio:hover { filter: brightness(1.15); }
+      .card-biblio.palida { opacity: 0.3; filter: grayscale(0.6); }
+      .card-biblio.palida:hover { opacity: 0.8; filter: none; }
+      .card-biblio.activa {
+        border-color: #ffffff; transform: translateY(-2px) scale(1.04);
+        box-shadow: 0 0 0 3px #2563eb, 0 8px 18px rgba(0, 0, 0, 0.35);
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -677,7 +1095,7 @@ st.markdown(
 
 URL_MARANGATU = "https://marangatu.set.gov.py/eset/login"
 
-col_buscador, col_marangatu = st.columns([4, 1], gap="medium")
+col_buscador, col_limpiar, col_marangatu = st.columns([4, 1, 1.4], gap="medium")
 with col_buscador:
     termino = st.text_input(
         "Buscar",
@@ -685,6 +1103,8 @@ with col_buscador:
         placeholder="Escribe una palabra clave (ej: dnit, dolar, decreto, ley)...",
         label_visibility="collapsed",
     )
+with col_limpiar:
+    st.button("✖ Limpiar", key="limpiar_general", on_click=limpiar_todo, width="stretch")
 with col_marangatu:
     st.markdown(
         f"""
@@ -723,7 +1143,7 @@ if termino.strip():
         total = sum(len(lista) for lista in por_seccion.values())
         st.caption(
             f"{total} apartado(s) con coincidencias en {len(por_seccion)} sección(es)."
-            "  ·  Borra el texto del buscador para volver al inicio."
+            "  ·  Usa «✖ Limpiar» para volver al inicio."
         )
 
         def pintar(seccion, lista):
@@ -746,7 +1166,7 @@ if termino.strip():
             f"No se encontraron resultados para «{termino}» en ninguna sección "
             "(Normativa Impositiva, Normativa Aduanera ni sus bibliotecas)."
         )
-        st.caption("Borra el texto del buscador para volver al inicio.")
+        st.caption("Usa «✖ Limpiar» para volver al inicio.")
 
 else:
     # -----------------------------------------------------------------
@@ -791,7 +1211,13 @@ else:
     # BIBLIOTECA: se mantiene debajo del buscador general (en la
     # pantalla principal) para acceso directo, agrupada por sección.
     # -----------------------------------------------------------------
-    for nombre in ("Normativa Impositiva", "Normativa Aduanera"):
+    seleccion_actual = (st.session_state.seccion, st.session_state.tipo)
+    hay_biblioteca_activa = any(
+        "logo" in i and seleccion_actual == (n, t)
+        for n, d in NAVEGACION.items() for t, i in d["items"].items()
+    )
+    estilos_biblioteca = []
+    for n_sec, nombre in enumerate(("Normativa Impositiva", "Normativa Aduanera")):
         datos = NAVEGACION[nombre]
         items_logo = {t: i for t, i in datos["items"].items() if "logo" in i}
         if not items_logo:
@@ -800,21 +1226,16 @@ else:
         columnas_logo = st.columns(4)
         for i, (tipo, item) in enumerate(items_logo.items()):
             with columnas_logo[i % 4]:
-                color_fondo = item.get("color", "#1e293b")
-                url_destino = f"?sec={urllib.parse.quote(nombre)}&tip={urllib.parse.quote(tipo)}"
-
-                st.markdown(
-                    f"""
-                    <a href="{url_destino}" target="_self" style="text-decoration: none;">
-                        <div style="background-color: {color_fondo}; padding: 12px; border-radius: 8px; 
-                        text-align: center; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; height: 65px; transition: filter 0.2s ease;"
-                        onmouseover="this.style.filter='brightness(1.15)'" onmouseout="this.style.filter='brightness(1)'" title="{tipo}">
-                            <img src="{item['logo']}" style="max-height: 40px; max-width: 100%; object-fit: contain;">
-                        </div>
-                    </a>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                clave_btn = f"bib_{n_sec}_{i}"
+                st.button(tipo, key=clave_btn, help=tipo, on_click=ir_a,
+                          args=(nombre, tipo), width="stretch")
+            estado = ""
+            if hay_biblioteca_activa:
+                estado = "activa" if (nombre, tipo) == seleccion_actual else "palida"
+            estilos_biblioteca.append(
+                css_tarjeta_biblioteca(clave_btn, item["logo"], item.get("color", "#1e293b"), estado)
+            )
+    st.markdown("<style>" + "".join(estilos_biblioteca) + "</style>", unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -824,11 +1245,13 @@ else:
     if st.session_state.seccion and st.session_state.tipo:
         seccion, tipo = st.session_state.seccion, st.session_state.tipo
         item = NAVEGACION[seccion]["items"][tipo]
-        col_titulo, col_accion = st.columns([5, 1])
-        with col_titulo:
-            st.subheader(f"{NAVEGACION[seccion]['icono']} Resultados: {seccion} › {tipo}")
-        with col_accion:
-            st.button("✖ Limpiar", on_click=volver_inicio, width="stretch")
-        mostrar_destino(seccion, tipo, item, "", con_titulo=False, clave="sec")
+        with st.container(key="resultados"):
+            col_titulo, col_accion = st.columns([5, 1])
+            with col_titulo:
+                st.subheader(f"{NAVEGACION[seccion]['icono']} Resultados: {seccion} › {tipo}")
+            with col_accion:
+                st.button("✖ Limpiar", on_click=volver_inicio, width="stretch")
+            mostrar_destino(seccion, tipo, item, "", con_titulo=False, clave="sec")
+        scroll_a_resultados()
     else:
         st.info("Selecciona una opción del menú lateral (izquierda) para ver los resultados aquí.")
