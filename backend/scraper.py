@@ -1318,7 +1318,7 @@ BIBLIOTECA_ADUANERA = [
      "logo": "https://www.dnit.gov.py/documents/20123/1067002/logo-vui.svg/a2adf0b8-b232-267b-38c4-9fb934ad1c38?t=1726087798981",
      "color": "#7c3aed"},
     {"nombre": "KITAPP", "fuente": "dnit_biblioteca_kitapp",
-     "logo": "https://www.dnit.gov.py/documents/44828/0/logo-regimenes.svg/677fa80b-0709-40df-49fa-6b53af1ed358?t=1727216298868",
+     "logo": "https://www.dnit.gov.py/documents/20123/1067002/logo-kitapp.svg/8424716e-f9a2-651e-5c4c-3a8399a599fd?t=1726083044444",
      "color": "#059669"},
     {"nombre": "TVF", "fuente": "dnit_biblioteca_tvf",
      "logo": "https://www.dnit.gov.py/documents/44828/0/logo-tvf.svg/b7312864-7c10-d7a8-76dc-f231056e986d?t=1727215159186",
