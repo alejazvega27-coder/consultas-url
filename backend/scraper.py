@@ -3,6 +3,7 @@ Logica de scraping: registro de fuentes, parsers y busqueda.
 Reutilizada por app.py (backend/frontend).
 """
 
+import copy
 import difflib
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -75,7 +76,7 @@ def parser_dnit(html: str) -> pd.DataFrame:
 
     df = pd.DataFrame(filas_totales)
     if not df.empty:
-        df = df.sort_values("fecha").drop_duplicates(subset="fecha").reset_index(drop=True)
+        df = df.sort_values("fecha", ascending=False).drop_duplicates(subset="fecha").reset_index(drop=True)
         df["fecha"] = df["fecha"].dt.strftime("%Y-%m-%d")
     return df
 
@@ -266,11 +267,697 @@ def _parser_biblioteca_generico(html: str, url_base: str = "https://www.dnit.gov
 
 def parser_biblioteca_aduanera(html: str, url_base: str = "https://www.dnit.gov.py",
                                max_chars: int = None) -> pd.DataFrame:
-    for estrategia in (parser_dnit_normativa, parser_biblioteca_categoria, _parser_biblioteca_generico):
+    for estrategia in (parser_dnit_normativa, parser_biblioteca_categoria,
+                       _parser_biblioteca_generico, _parser_enlaces_documentos):
         df = estrategia(html, url_base, max_chars)
         if not df.empty:
             return df
     return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# TABLAS HTML GENERICAS + ESTRATEGIAS DE RESPALDO
+# (dictamenes, enmiendas, bibliotecas sin listado, instructivos)
+# ---------------------------------------------------------------------------
+
+_RE_ARCHIVO = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|csv|txt|zip|rar)(?=[/?#]|$)", re.IGNORECASE)
+_PALABRAS_ACCION = {"descargar", "ver", "download", "visibility", "ver archivo", "abrir"}
+_COLS_ENLACE = ("Enlace Descargar", "Enlace Ver")
+_RE_FECHA_CELDA = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+COLUMNAS_NORMAS = ["Sección", "Fecha", "Título", "Descripción", "Enlace Descargar", "Enlace Ver"]
+
+
+_RE_IMAGEN = re.compile(r"\.(png|jpe?g|gif|svg|webp|ico)(?=[/?#]|$)", re.IGNORECASE)
+
+
+def _es_recurso_del_sitio(href: str) -> bool:
+    """Logos, iconos e imagenes del portal (no son documentos de la tabla)."""
+    return "/documents/d/global/" in href or bool(_RE_IMAGEN.search(href))
+
+
+def _contenido_principal(soup):
+    """Zona de contenido de la pagina (sin menu, cabecera ni pie)."""
+    for selector in ("main", "#main-content", "[role='main']", "#content"):
+        zona = soup.select_one(selector)
+        if zona is not None and len(_texto(zona)) > 40:
+            return zona
+    for tag in soup.select("nav, header, footer, aside, [role='navigation'], .navbar, .dropdown-menu"):
+        tag.decompose()
+    return soup
+
+
+def _texto(tag) -> str:
+    return " ".join(tag.get_text(" ", strip=True).split())
+
+
+def _es_accion(texto: str) -> bool:
+    """True si la celda solo contiene textos de botones ('Descargar', 'Ver', iconos)."""
+    if not texto.strip():
+        return False
+    limpio = texto.lower()
+    for palabra in ("download", "visibility", "descargar", "archivo", "abrir", "ver"):
+        limpio = limpio.replace(palabra, " ")
+    return not limpio.strip(" \t·|-")
+
+
+def _enlaces_de(contenedor, url_base: str):
+    """Devuelve (descargar, ver) con los enlaces del contenedor (fila, bloque...)."""
+    descargar = ver = otro = ""
+    for a in contenedor.find_all("a", href=True):
+        href = (a["href"] or "").strip()
+        if not href or href.startswith(("#", "javascript", "mailto", "tel")):
+            continue
+        if _es_recurso_del_sitio(href):
+            continue
+        enlace = urljoin(url_base, href.replace(" ", "%20"))
+        tipo = _tipo_enlace(a)
+        if tipo == "ver":
+            ver = ver or enlace
+        elif tipo == "descargar" or _RE_ARCHIVO.search(href) or "/documents/" in href:
+            descargar = descargar or enlace
+        else:
+            otro = otro or enlace
+    if otro and not descargar:
+        descargar = otro
+    return descargar, ver
+
+
+def _nombres_unicos(nombres):
+    vistos, salida = {}, []
+    for i, nombre in enumerate(nombres, 1):
+        nombre = nombre or f"Columna {i}"
+        if nombre in vistos:
+            vistos[nombre] += 1
+            nombre = f"{nombre} ({vistos[nombre]})"
+        else:
+            vistos[nombre] = 1
+        salida.append(nombre)
+    return salida
+
+
+def _titulo_tabla(tabla) -> str:
+    cap = tabla.find("caption")
+    if cap is not None and _texto(cap):
+        return _texto(cap)
+    previo = tabla.find_previous(["h1", "h2", "h3", "h4", "h5", "h6"])
+    return _texto(previo) if previo is not None else ""
+
+
+def extraer_tablas(html: str, url_base: str = "https://www.dnit.gov.py"):
+    """Extrae TODAS las <table> de la pagina conservando sus columnas reales.
+
+    Devuelve una lista de (titulo_tabla, DataFrame). Los enlaces de cada fila se
+    guardan en 'Enlace Descargar' / 'Enlace Ver'. Las filas de una sola celda
+    (subtitulos) se guardan como columna 'Grupo'.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+
+    resultado = []
+    zona = _contenido_principal(soup)
+    for tabla in (zona.find_all("table") or soup.find_all("table")):
+        if tabla.find_parent("table") is not None:
+            continue
+        filas = [tr for tr in tabla.find_all("tr") if tr.find_parent("table") is tabla]
+        if not filas:
+            continue
+
+        def celdas_de(tr):
+            return tr.find_all(["th", "td"], recursive=False)
+
+        encabezado = None
+        primera = celdas_de(filas[0])
+        if primera and (all(c.name == "th" for c in primera) or filas[0].find_parent("thead") is not None):
+            encabezado = [_texto(c) for c in primera]
+            filas = filas[1:]
+            while filas and celdas_de(filas[0]) and all(c.name == "th" for c in celdas_de(filas[0])):
+                filas = filas[1:]
+        elif (len(primera) >= 2 and not filas[0].find("a")
+              and all(_texto(c) for c in primera) and len(filas) > 1):
+            encabezado = [_texto(c) for c in primera]
+            filas = filas[1:]
+
+        registros, grupo, hay_grupo = [], "", False
+        for tr in filas:
+            celdas = celdas_de(tr)
+            textos = [_texto(c) for c in celdas]
+            descargar, ver = _enlaces_de(tr, url_base)
+            if not any(textos) and not (descargar or ver):
+                continue
+            no_vacios = [t for t in textos if t]
+            if len(celdas) == 1 and len(no_vacios) == 1 and not (descargar or ver) and (
+                    encabezado is None or len(encabezado) > 1):
+                grupo, hay_grupo = no_vacios[0], True
+                continue
+            registros.append((textos, descargar, ver, grupo))
+
+        if not registros:
+            continue
+
+        ncols = max(len(encabezado or []), max(len(r[0]) for r in registros))
+        nombres = list(encabezado or [])
+        nombres += [""] * (ncols - len(nombres))
+        nombres = _nombres_unicos(nombres)
+
+        filas_df = []
+        for textos, descargar, ver, grupo in registros:
+            fila = {}
+            if hay_grupo:
+                fila["Grupo"] = grupo
+            for i, nombre in enumerate(nombres):
+                valor = textos[i] if i < len(textos) else ""
+                fila[nombre] = "" if _es_accion(valor) else valor
+            fila["Enlace Descargar"] = descargar
+            fila["Enlace Ver"] = ver
+            filas_df.append(fila)
+
+        df = pd.DataFrame(filas_df)
+        vacias = [c for c in df.columns if (df[c] == "").all()]
+        df = df.drop(columns=vacias)
+        if df.empty:
+            continue
+        resultado.append((_titulo_tabla(tabla), df.reset_index(drop=True)))
+    return resultado
+
+
+def parser_tablas(html: str, url_base: str = "https://www.dnit.gov.py",
+                  max_chars: int = None) -> pd.DataFrame:
+    """Une las tablas de la pagina en un solo DataFrame (columnas reales)."""
+    tablas = extraer_tablas(html, url_base)
+    if not tablas:
+        return pd.DataFrame()
+    partes = []
+    for n, (titulo, df) in enumerate(tablas, 1):
+        if len(tablas) > 1:
+            df = df.copy()
+            df.insert(0, "Tabla", titulo or f"Tabla {n}")
+        partes.append(df)
+    df = pd.concat(partes, ignore_index=True).fillna("")
+    datos = [c for c in df.columns if c not in _COLS_ENLACE]
+    df = df[datos + [c for c in _COLS_ENLACE if c in df.columns]]
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+def _parser_enlaces_documentos(html: str, url_base: str = "https://www.dnit.gov.py",
+                               max_chars: int = None) -> pd.DataFrame:
+    """Respaldo: arma registros a partir de los enlaces a documentos de la pagina.
+    Titulo = texto del enlace (o el encabezado previo si el enlace es 'Descargar'),
+    Descripcion = texto del bloque que lo contiene."""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    zona = _contenido_principal(soup)
+
+    registros = {}
+    for a in zona.find_all("a", href=True):
+        href = (a["href"] or "").strip()
+        if not href or href.startswith(("#", "javascript", "mailto", "tel")):
+            continue
+        if _es_recurso_del_sitio(href):
+            continue
+        tipo = _tipo_enlace(a)
+        if not (tipo or _RE_ARCHIVO.search(href) or "/documents/" in href):
+            continue
+        enlace = urljoin(url_base, href.replace(" ", "%20"))
+        texto = _texto(a)
+        previo = a.find_previous(["h1", "h2", "h3", "h4", "h5", "h6"])
+        bloque = a.find_parent(["li", "tr", "article", "p", "div"])
+        descripcion = ""
+        if bloque is not None:
+            copia = copy.copy(bloque)
+            for x in copia.find_all("a"):
+                x.decompose()
+            descripcion = _texto(copia)
+        if tipo or len(texto) < 4 or _es_accion(texto):
+            titulo = _texto(previo) if previo is not None else ""
+            titulo = titulo or nombre_archivo_simple(enlace)
+        else:
+            titulo = texto
+            descripcion = descripcion.replace(titulo, "").strip(" :-·\t")
+        if descripcion == titulo:
+            descripcion = ""
+        if max_chars and len(descripcion) > max_chars:
+            descripcion = descripcion[:max_chars].strip() + "..."
+        reg = registros.setdefault((titulo, descripcion[:300]), {
+            "Título": titulo, "Descripción": descripcion[:600],
+            "Enlace Descargar": "", "Enlace Ver": ""})
+        if tipo == "ver":
+            reg["Enlace Ver"] = reg["Enlace Ver"] or enlace
+        else:
+            reg["Enlace Descargar"] = reg["Enlace Descargar"] or enlace
+    return pd.DataFrame(list(registros.values()))
+
+
+def nombre_archivo_simple(url: str) -> str:
+    ruta = unquote_plus(urlparse(url).path)
+    for segmento in reversed(ruta.split("/")):
+        if segmento:
+            return segmento
+    return "Documento"
+
+
+def parser_biblioteca_robusto(html: str, url_base: str = "https://www.dnit.gov.py",
+                              max_chars: int = None) -> pd.DataFrame:
+    """Bibliotecas: prueba el parser especifico y, si la pagina no trae ese formato,
+    las demas estructuras conocidas. (Las tablas se muestran aparte, ver app.py.)"""
+    for estrategia in (parser_biblioteca_categoria, parser_dnit_normativa,
+                       _parser_biblioteca_generico, _parser_enlaces_documentos):
+        df = estrategia(html, url_base, max_chars)
+        if not df.empty:
+            return df
+    return pd.DataFrame()
+
+
+def parser_tablas_o_listado(html: str, url_base: str = "https://www.dnit.gov.py",
+                            max_chars: int = None) -> pd.DataFrame:
+    """Paginas cuyo contenido principal son tablas (dictamenes, enmienda del SA).
+    1) tablas <table> del contenido; 2) enlaces a documentos del contenido."""
+    df = parser_tablas(html, url_base, max_chars)
+    if not df.empty:
+        return df
+    return _parser_enlaces_documentos(html, url_base, max_chars)
+
+
+def diagnosticar_pagina(html: str, url_base: str = "https://www.dnit.gov.py", muestras=()) -> dict:
+    """Resumen de lo que realmente trae el HTML (para ajustar el parser)."""
+    crudo = html
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    total_tablas = len(soup.find_all("table"))
+    iframes = [i.get("src", "") for i in soup.find_all("iframe")][:5]
+    zona = _contenido_principal(soup)
+    docs = [a["href"] for a in zona.find_all("a", href=True)
+            if (_RE_ARCHIVO.search(a["href"]) or "/documents/" in a["href"])
+            and not _es_recurso_del_sitio(a["href"])]
+    info = {
+        "bytes_html": len(crudo),
+        "tablas_en_pagina": total_tablas,
+        "iframes": iframes,
+        "enlaces_a_documentos": len(docs),
+        "encabezados": [_texto(h) for h in zona.find_all(["h1", "h2", "h3", "h4"])][:12],
+    }
+    for muestra in muestras:
+        entrada = {"en_html_crudo": muestra in crudo, "en_dom_visible": False}
+        nodo = soup.find(string=lambda t: t and muestra in t)
+        if nodo is not None:
+            entrada["en_dom_visible"] = True
+            cadena, el = [], nodo.parent
+            while el is not None and el.name != "[document]" and len(cadena) < 7:
+                padre = el.parent
+                iguales = 0
+                if padre is not None:
+                    firma = (el.name, tuple(sorted(el.get("class", []))))
+                    iguales = sum(1 for h in padre.find_all(True, recursive=False)
+                                  if (h.name, tuple(sorted(h.get("class", [])))) == firma)
+                cadena.append({"etiqueta": el.name, "clase": " ".join(el.get("class", [])),
+                               "hijos": len(el.find_all(True, recursive=False)),
+                               "hermanos_misma_firma": iguales})
+                el = padre
+            entrada["ancestros_desde_la_celda"] = cadena
+            entrada["fragmento_html"] = str(nodo.parent.parent)[:600] if nodo.parent.parent else ""
+        info[f"muestra: {muestra}"] = entrada
+    return info
+
+
+def _tablas_a_registros(tablas) -> pd.DataFrame:
+    filas = []
+    for titulo, df in tablas:
+        datos = [c for c in df.columns if c not in _COLS_ENLACE]
+        for _, fila in df.iterrows():
+            valores = [(c, str(fila[c]).strip()) for c in datos if str(fila[c]).strip()]
+            if not valores:
+                continue
+            titulo_fila = valores[0][1]
+            resto = [f"{c}: {v}" for c, v in valores[1:]]
+            fecha = next((v for _, v in valores if _RE_FECHA_CELDA.search(v)), "")
+            filas.append({
+                "Sección": titulo or "", "Fecha": fecha, "Título": titulo_fila,
+                "Descripción": " · ".join(resto),
+                "Enlace Descargar": fila.get("Enlace Descargar", ""),
+                "Enlace Ver": fila.get("Enlace Ver", ""),
+            })
+    return pd.DataFrame(filas)
+
+
+def parser_instructivos(html: str, url_base: str = "https://www.dnit.gov.py") -> pd.DataFrame:
+    """Instructivos con titulo y descripcion por apartado (mismas estructuras que
+    el resto del portal: titulo + descripcion + Descargar/Ver; luego tablas; luego enlaces)."""
+    df = pd.DataFrame()
+    for estrategia in (parser_dnit_normativa, parser_biblioteca_categoria, _parser_biblioteca_generico):
+        df = estrategia(html, url_base)
+        if not df.empty:
+            break
+    if df.empty:
+        tablas = extraer_tablas(html, url_base)
+        if tablas:
+            df = _tablas_a_registros(tablas)
+    if df.empty:
+        df = _parser_enlaces_documentos(html, url_base)
+    for col in COLUMNAS_NORMAS:
+        if col not in df.columns:
+            df[col] = ""
+    df["Sección"] = df["Sección"].replace("", "Instructivos")
+    return df[COLUMNAS_NORMAS].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# TABLAS DE LA DNIT CON ENCABEZADO CONOCIDO (Dictamenes y Correlacion NCM)
+# Funciona tanto si la pagina usa <table> como si usa <div> en forma de grilla.
+# ---------------------------------------------------------------------------
+_RE_FECHA_DMY = re.compile(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4})(?!\d)")
+
+
+def _clave_texto(texto: str) -> str:
+    """Minusculas, sin acentos, sin espacios y con guiones unificados."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode().lower()
+    t = t.replace("–", "-").replace("—", "-")
+    return re.sub(r"\s+", "", t)
+
+
+def _texto_celda(tag, sep: str = " ") -> str:
+    """Texto de una celda; los <br>/<p> se unen con 'sep'."""
+    if tag.find(["br", "p", "li", "div"]) is None:
+        return " ".join(tag.get_text(" ").split())
+    copia = copy.copy(tag)
+    for br in copia.find_all("br"):
+        br.replace_with("\x00")
+    for bloque in copia.find_all(["p", "li", "div"]):
+        bloque.append("\x00")
+    partes = [" ".join(p.split()) for p in copia.get_text(" ").split("\x00")]
+    return sep.join(p for p in partes if p)
+
+
+def _coincide_etiqueta(clave_texto: str, etiqueta: str) -> bool:
+    if clave_texto == etiqueta:
+        return True
+    return len(etiqueta) >= 8 and etiqueta in clave_texto and len(clave_texto) <= len(etiqueta) + 25
+
+
+def _ubicaciones_encabezado(cadenas, claves, limite: int = 8):
+    """Genera TODOS los grupos de textos consecutivos que contienen las etiquetas, en orden
+    (la pagina puede tener un encabezado oculto/duplicado ademas del visible)."""
+    cantidad = 0
+    for i, (s, k) in enumerate(cadenas):
+        if not _coincide_etiqueta(k, claves[0]):
+            continue
+        encontrados, j, completo = [s], i, True
+        for etiqueta in claves[1:]:
+            hallado = None
+            for m in range(j + 1, min(j + 60, len(cadenas))):
+                if _coincide_etiqueta(cadenas[m][1], etiqueta):
+                    hallado = m
+                    break
+            if hallado is None:
+                completo = False
+                break
+            encontrados.append(cadenas[hallado][0])
+            j = hallado
+        if completo:
+            yield encontrados
+            cantidad += 1
+            if cantidad >= limite:
+                return
+
+
+def _ancestro_comun(tags):
+    comun = [tags[0]] + list(tags[0].parents)
+    for t in tags[1:]:
+        ids = {id(x) for x in [t] + list(t.parents)}
+        comun = [a for a in comun if id(a) in ids]
+    return comun[0] if comun else None
+
+
+def _celdas_desde_encabezado(ubicados, ncols: int):
+    """Lista de filas (cada una, lista de elementos-celda) que siguen al encabezado."""
+    lca = _ancestro_comun([s.parent for s in ubicados])
+    if lca is None or lca.name == "[document]":
+        return []
+    hijos = lca.find_all(True, recursive=False)
+    if len(hijos) > 3 * ncols:                         # grilla plana
+        primero = ubicados[0]
+        i0 = next((i for i, h in enumerate(hijos)
+                   if any(p is h for p in primero.parents) or primero.parent is h), 0)
+        datos = hijos[i0 + ncols:]
+        return [datos[k:k + ncols] for k in range(0, len(datos), ncols)]
+
+    clave_enc = _clave_texto(_texto(lca))
+    if lca.name == "tr":
+        tabla = lca.find_parent("table")
+        filas_el = [tr for tr in tabla.find_all("tr")
+                    if tr is not lca and tr.find_parent("table") is tabla] if tabla else []
+    else:
+        nodo, hermanos = lca, []
+        for _ in range(3):
+            hermanos = nodo.find_next_siblings(True)
+            if len(hermanos) == 1 and len(hermanos[0].find_all(True, recursive=False)) >= 2:
+                hermanos = hermanos[0].find_all(True, recursive=False)   # cuerpo envuelto
+            if len(hermanos) >= 2:
+                break
+            nodo = nodo.parent
+            if nodo is None:
+                break
+        filas_el = []
+        for h in hermanos:
+            if h.name in ("tbody", "tfoot"):
+                filas_el.extend(h.find_all("tr"))
+            else:
+                filas_el.append(h)
+    resultado = []
+    for fila in filas_el:
+        if _clave_texto(_texto(fila)) == clave_enc:
+            continue
+        celdas = fila.find_all(["td", "th"], recursive=False) or fila.find_all(True, recursive=False)
+        resultado.append(celdas or [fila])
+    return resultado
+
+
+def _df_desde_celdas(celdas_por_fila, columnas, url_base: str, sep: str = " ") -> pd.DataFrame:
+    ncols = len(columnas)
+    registros, hay_enlaces = [], False
+    for celdas in celdas_por_fila:
+        textos = [_texto_celda(c, sep) for c in celdas]
+        if not any(textos):
+            continue
+        if all(t.strip().lower() in ("", "oculto", "hidden") for t in textos):
+            continue                                    # filas ocultas del portal
+        if len(textos) > ncols:
+            textos = textos[:ncols - 1] + [" ".join(textos[ncols - 1:])]
+        textos += [""] * (ncols - len(textos))
+        descargar = ver = ""
+        for c in celdas:
+            d, v = _enlaces_de(c, url_base)
+            descargar, ver = descargar or d, ver or v
+        hay_enlaces = hay_enlaces or bool(descargar or ver)
+        registros.append(textos + [descargar, ver])
+    if not registros:
+        return pd.DataFrame()
+    df = pd.DataFrame(registros, columns=list(columnas) + list(_COLS_ENLACE))
+    if not hay_enlaces:
+        df = df.drop(columns=list(_COLS_ENLACE))
+    else:
+        df = df.drop(columns=[c for c in _COLS_ENLACE if (df[c] == "").all()])
+    return df.reset_index(drop=True)
+
+
+def extraer_tabla_por_encabezado(html: str, etiquetas, columnas, url_base: str = "https://www.dnit.gov.py",
+                                 sep: str = " ") -> pd.DataFrame:
+    """Busca la tabla por su encabezado (sin depender de <table>). Prueba todas las
+    ubicaciones del encabezado y devuelve la que aporta MAS filas."""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    claves = [_clave_texto(e) for e in etiquetas]
+    cadenas = [(s, _clave_texto(str(s))) for s in soup.find_all(string=True)
+               if s.__class__.__name__ == "NavigableString" and str(s).strip()]
+    cadenas = [(s, k) for s, k in cadenas if k]
+    mejor = pd.DataFrame()
+    for ubicados in _ubicaciones_encabezado(cadenas, claves):
+        df = _df_desde_celdas(_celdas_desde_encabezado(ubicados, len(columnas)), columnas, url_base, sep)
+        if len(df) > len(mejor):
+            mejor = df
+    return mejor
+
+
+def extraer_tabla_por_ancla(html: str, patron: str, columnas_por_ncols: dict,
+                            url_base: str = "https://www.dnit.gov.py", sep: str = " ",
+                            min_celdas: int = 2, min_filas: int = 10) -> pd.DataFrame:
+    """Sin usar encabezados: parte de un dato conocido (patron) y sube hasta encontrar el
+    elemento que se repite como fila (>= min_filas hermanos con la misma etiqueta/clase)."""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    rx = re.compile(patron)
+    firma = lambda e: (e.name, tuple(sorted(e.get("class", []))))
+    mejor = pd.DataFrame()
+    for n, ancla in enumerate(soup.find_all(string=rx)):
+        if n >= 4:
+            break
+        el, filas = ancla.parent, None
+        while el is not None and el.name != "[document]" and el.parent is not None:
+            iguales = [h for h in el.parent.find_all(True, recursive=False) if firma(h) == firma(el)]
+            if len(iguales) >= min_filas and len(el.find_all(True, recursive=False)) >= min_celdas:
+                filas = iguales
+                break
+            el = el.parent
+        if not filas:
+            continue
+        celdas_filas = []
+        for f in filas:
+            celdas = f.find_all(["td", "th"], recursive=False) or f.find_all(True, recursive=False)
+            claves_celdas = {_clave_texto(_texto(c)) for c in celdas}
+            if {"fecha", "pais"} <= claves_celdas:
+                continue                                  # fila de encabezado
+            celdas_filas.append(celdas)
+        if not celdas_filas:
+            continue
+        conteos = [len(c) for c in celdas_filas]
+        ncols = max(set(conteos), key=conteos.count)
+        columnas = columnas_por_ncols.get(ncols) or [f"Columna {i + 1}" for i in range(ncols)]
+        df = _df_desde_celdas(celdas_filas, columnas, url_base, sep)
+        if len(df) > len(mejor):
+            mejor = df
+    return mejor
+
+
+_PAT_FECHA = r"(?<!\d)\d{1,2}/\d{1,2}/\d{4}(?!\d)"
+_PAT_CODIGO = r"\d{4}\.\d{2}\.\d{2}"
+
+
+def _puntaje_dictamenes(df: pd.DataFrame) -> int:
+    """Filas con aspecto de dictamen: traen una fecha dd/mm/aaaa y un codigo NCM."""
+    filas = df.drop_duplicates().astype(str).agg(" ".join, axis=1)
+    return int((filas.str.contains(_PAT_FECHA) & filas.str.contains(_PAT_CODIGO)).sum())
+
+
+def _puntaje_correlacion(df: pd.DataFrame) -> int:
+    col = COLUMNAS_CORRELACION[0]
+    return int(df[col].astype(str).str.match(r"\s*" + _PAT_CODIGO).sum()) if col in df.columns else 0
+
+
+def _elegir_mejor(generadores, puntaje, suficiente: int = 5) -> pd.DataFrame:
+    """Prueba estrategias en orden; devuelve la de mayor puntaje (vacia si ninguna es valida)."""
+    mejor, mejor_p = pd.DataFrame(), 0
+    for generar in generadores:
+        df = generar()
+        if df.empty:
+            continue
+        p = puntaje(df)
+        if p > mejor_p:
+            mejor, mejor_p = df, p
+        if p >= suficiente and p >= 0.7 * len(df.drop_duplicates()):
+            break
+    return mejor
+
+
+_ALIAS_COLUMNAS = {
+    "nro.res.": "Resolución", "nro.res": "Resolución", "resolucion": "Resolución",
+    "resoluciondan/mercosur": "Resolución DAN / MERCOSUR", "pais": "País",
+    "mercaderia": "Mercadería", "descripcion": "Descripción", "clasif.": "Clasificación",
+    "clasificacion": "Clasificación", "fundamentolegal": "Fundamento Legal",
+    "obs.": "Observaciones", "observaciones": "Observaciones",
+}
+
+
+def _mejor_tabla_html(html: str, url_base: str, min_columnas: int) -> pd.DataFrame:
+    """Respaldo: la <table> con mas filas (si la pagina si usa <table>), columnas renombradas."""
+    mejor = pd.DataFrame()
+    for _, df in extraer_tablas(html, url_base):
+        datos = [c for c in df.columns if c not in _COLS_ENLACE]
+        if len(datos) >= min_columnas and len(df) > len(mejor):
+            mejor = df.rename(columns=lambda c: _ALIAS_COLUMNAS.get(_clave_texto(str(c)), c))
+    return mejor
+
+
+COLUMNAS_DICTAMENES_9 = ["Resolución", "Fecha", "País", "Dictamen", "Mercadería", "Descripción",
+                         "Clasificación", "Fundamento Legal", "Observaciones"]
+COLUMNAS_DICTAMENES = ["Resolución", "Resolución DAN / MERCOSUR", "Fecha", "País", "Dictamen",
+                       "Mercadería", "Descripción", "Clasificación", "Fundamento Legal", "Observaciones"]
+
+
+def parser_dictamenes(html: str, url_base: str = "https://www.dnit.gov.py",
+                      max_chars: int = None) -> pd.DataFrame:
+    """Tabla 'Dictamenes de Clasificacion' tal como la publica la DNIT (+ Año y Capítulo).
+    Soporta el formato actual (9 columnas: Nro. Res., ..., Clasif., ..., Obs.) y el anterior (10)."""
+    df = _elegir_mejor([
+        lambda: extraer_tabla_por_encabezado(
+            html, ["Nro. Res.", "Fecha", "País", "Dictamen", "Mercadería", "Clasif."],
+            COLUMNAS_DICTAMENES_9, url_base),
+        lambda: extraer_tabla_por_ancla(
+            html, r"Dictamen\s+de\s+Clasificaci[oó]n",
+            {9: COLUMNAS_DICTAMENES_9, 10: COLUMNAS_DICTAMENES}, url_base, min_celdas=5),
+        lambda: extraer_tabla_por_encabezado(
+            html, ["Resolución", "Fecha", "País", "Dictamen", "Mercadería", "Clasificación"],
+            COLUMNAS_DICTAMENES, url_base),
+        lambda: _mejor_tabla_html(html, url_base, 7),
+    ], _puntaje_dictamenes)
+    if df.empty or "Fecha" not in df.columns:
+        return df
+
+    # La fuente tiene filas con Fecha/País invertidos o con la etiqueta pegada en 'Dictamen'.
+    patron = r"(?<!\d)\d{1,2}/\d{1,2}/\d{4}(?!\d)"
+    if "País" in df.columns:
+        pais_es_fecha = df["País"].str.contains(patron) & ~df["Fecha"].str.contains(patron)
+        df.loc[pais_es_fecha, ["Fecha", "País"]] = df.loc[pais_es_fecha, ["País", "Fecha"]].values
+    if "Dictamen" in df.columns:
+        df["Dictamen"] = df["Dictamen"].str.replace(r"^\s*Fecha\s+\S+\s+País\s+", "", regex=True)
+
+    def anio(fecha):
+        m = _RE_FECHA_DMY.search(fecha or "")
+        return m.group(3) if m else ""
+
+    df.insert(df.columns.get_loc("Fecha") + 1, "Año", df["Fecha"].map(anio))
+    if "Clasificación" in df.columns:
+        def capitulo(clasif):
+            m = re.match(r"\s*(\d{2})", clasif or "")
+            return m.group(1) if m else ""
+        df.insert(df.columns.get_loc("Clasificación") + 1, "Capítulo", df["Clasificación"].map(capitulo))
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+COLUMNAS_CORRELACION = ["NCM 2017 (VI Enmienda)", "NCM 2022 (VII Enmienda)"]
+
+
+def parser_correlacion_ncm(html: str, url_base: str = "https://www.dnit.gov.py",
+                           max_chars: int = None) -> pd.DataFrame:
+    """Tabla de Correlacion NCM 2017 -> NCM 2022 (VII Enmienda) (+ Capítulo y tipo de correlación)."""
+    def desde_tablas_html():
+        mejor_html = _mejor_tabla_html(html, url_base, 2)
+        if mejor_html.empty:
+            return pd.DataFrame()
+        datos = [c for c in mejor_html.columns if c not in _COLS_ENLACE][:2]
+        t = mejor_html[datos].copy()
+        t.columns = COLUMNAS_CORRELACION
+        return t
+
+    df = _elegir_mejor([
+        lambda: extraer_tabla_por_encabezado(html, ["NCM - 2017", "NCM - 2022"], COLUMNAS_CORRELACION,
+                                             url_base, sep=" · "),
+        lambda: extraer_tabla_por_ancla(html, r"^\s*\d{4}\.\d{2}\.\d{2}\w?\s*$",
+                                        {2: COLUMNAS_CORRELACION}, url_base, sep=" · ",
+                                        min_celdas=2, min_filas=20),
+        desde_tablas_html,
+    ], _puntaje_correlacion)
+    if df.empty:
+        return df
+    c17, c22 = COLUMNAS_CORRELACION
+
+    def capitulo(valor):
+        m = re.match(r"\s*(\d{2})\d{2}\.", valor or "")
+        return m.group(1) if m else ""
+
+    def tipo(valor):
+        v = (valor or "").strip()
+        if not v or v == "-":
+            return "Sin correspondencia"
+        return "Parcial (EX)" if re.search(r"\bex\b", v, re.IGNORECASE) else "Plena"
+
+    df = df.copy()
+    df.insert(0, "Capítulo", df[c17].map(capitulo))
+    df.insert(3, "Correlación", df[c22].map(tipo))
+    return df.drop_duplicates().reset_index(drop=True)
 
 
 def _limpiar_numero(texto: str):
@@ -575,7 +1262,28 @@ FUENTES = [
         "categoria": "aduanera",
         "parser": parser_biblioteca_categoria,
     },
+    {
+        "id": "dnit_dictamenes_adu",
+        "nombre": "DNIT - Dictámenes de Clasificación (Aduanera)",
+        "alias": ["dictamen", "dictamenes", "clasificacion"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/dictamenes-de-clasificacion",
+        "categoria": "aduanera",
+        "parser": parser_dictamenes,
+    },
+    {
+        "id": "dnit_enmienda_vii",
+        "nombre": "DNIT - VII Enmienda del Sistema Armonizado (NCM)",
+        "alias": ["enmienda", "vii enmienda", "sistema armonizado", "ncm"],
+        "url": "https://www.dnit.gov.py/web/portal-institucional/vii-enmienda-del-sistema-armonizado-a-la-nomenclatura-com%C3%BAn-del-mercosur",
+        "categoria": "aduanera",
+        "parser": parser_correlacion_ncm,
+    },
 ]
+
+# Las bibliotecas con el parser base prueban ademas otras estructuras de pagina
+for _f in FUENTES:
+    if _f["parser"] is parser_biblioteca_categoria:
+        _f["parser"] = parser_biblioteca_robusto
 
 # Bibliotecas con sus respectivos colores institucionales
 BIBLIOTECA_IMPOSITIVA = [
@@ -773,4 +1481,3 @@ def ejecutar_busqueda(termino: str, fuente_id: str = None):
 
     df_filtrado = df[filtro].reset_index(drop=True)
     return fuente, df_filtrado
-    
