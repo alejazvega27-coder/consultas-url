@@ -410,14 +410,26 @@ def anios_fila(fila, columnas_texto: list[str]) -> set[str]:
     return anios
 
 
+def columnas_buscables(df):
+    """Columnas donde se busca texto.
+    - Si la tabla tiene 'Título' (normativa): solo Título y Descripción.
+    - Si no (cotizaciones, dictámenes, tablas de páginas): todas menos los enlaces.
+    """
+    if "Título" in df.columns:
+        return [c for c in ("Título", "Descripción") if c in df.columns]
+    return [c for c in df.columns if not str(c).startswith("Enlace")]
+
+
 def filtrar_df(df, texto: str):
     tokens = normalizar(texto).split()
     if df.empty or not tokens:
         return df
-    filas = df.astype(str).apply(lambda col: col.map(normalizar)).apply(" ".join, axis=1)
+    cols = columnas_buscables(df)
+    if not cols:
+        return df
+    filas = df[cols].astype(str).apply(lambda col: col.map(normalizar)).apply(" ".join, axis=1)
     mascara = filas.apply(lambda fila: all(t in fila for t in tokens))
     return df[mascara].reset_index(drop=True)
-
 
 def obtener_df(item: dict, filtro: str):
     if item["fuente"] in FUENTES_INSTRUCTIVOS:
@@ -457,8 +469,13 @@ def mostrar_tabla_fuente(item: dict, filtro_base: str, clave: str, selects=(), t
             st.error(f"No se pudo descargar la página: {e}")
             df = pd.DataFrame()
     if df.empty:
-        st.warning("No se pudo leer la tabla de la página. Revisa el diagnóstico de abajo.")
-        mostrar_diagnostico(fuente["url"], clave, MUESTRAS_DIAGNOSTICO.get(item["fuente"], ()))
+        st.warning("No se pudo leer la tabla de la página")
+        if st.button("🔄 Reintentar (limpiar caché)", key=f"tf_retry_{clave}"):
+            cargar.clear()
+            st.rerun()
+        if item["fuente"] == "dnit_biblioteca_regimenes":
+            mostrar_diagnostico(fuente["url"], clave, ("DSEM", "EC01"))
+        # mostrar_diagnostico(fuente["url"], clave, MUESTRAS_DIAGNOSTICO.get(item["fuente"], ()))
         return
 
     total = len(df)
@@ -529,7 +546,7 @@ def mostrar_tabla_fuente(item: dict, filtro_base: str, clave: str, selects=(), t
         st.dataframe(df, **opciones)
     st.download_button("⬇ Descargar CSV (filas filtradas)", df.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{item['fuente']}.csv", mime="text/csv", key=f"tf_csv_{clave}")
-    mostrar_diagnostico(fuente["url"], clave, MUESTRAS_DIAGNOSTICO.get(item["fuente"], ()))
+    #mostrar_diagnostico(fuente["url"], clave, MUESTRAS_DIAGNOSTICO.get(item["fuente"], ()))
 
 
 MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
@@ -737,7 +754,7 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
         else:
             mostrar_tabla(df_instructivos, {"nombre": titulo_instructivos, "url": url_instructivos},
                           clave=f"tabla_{clave}_{item['fuente']}")
-        st.link_button("🌐 Abrir fuente oficial de instructivos", url_instructivos, use_container_width=True)
+        #st.link_button("🌐 Abrir fuente oficial de instructivos", url_instructivos, use_container_width=True)
         return
 
     if item["fuente"] == "dnit_biblioteca_mesa":
@@ -791,10 +808,7 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
                 st.info("No se pudieron detectar recursos individuales automáticamente. Consultá la página oficial.")
         except (requests.RequestException, ValueError) as error:
             st.warning(f"No se pudieron cargar los recursos automáticamente: {error}")
-        mostrar_tablas_pagina(url_pvaa, f"pg_{clave}_pvaa")
-        st.link_button("🌐 Abrir página oficial de PVAA", url_pvaa, use_container_width=True)
-        with st.expander("Vista integrada del portal oficial"):
-            st.components.v1.iframe(url_pvaa, height=650, scrolling=True)
+        #mostrar_tablas_pagina(url_pvaa, f"pg_{clave}_pvaa")
         return
 
     if item["fuente"] == "dnit_cotizaciones":
@@ -820,6 +834,17 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
                   "«EX» indica que la correlación no es plena: los códigos alcanzados "
                   "corresponden a más de un ítem."),
             anchos={"NCM 2017 (VI Enmienda)": "medium", "NCM 2022 (VII Enmienda)": "large"})
+        return
+
+    if item["fuente"] == "dnit_biblioteca_regimenes":
+        mostrar_tabla_fuente(
+            item, filtro_base, f"{clave}_{seccion}_{tipo}",
+            selects=("Tipo", "Obs.", "Import/Export", "Cancela DDT"),
+            textos=("Código", "Descripción"),
+            nota="Destinaciones de Importación y Exportación (suspensivos, definitivos y temporales). "
+                 "«*» indica que la fuente no informa ese dato.",
+            anchos={"N°": "small", "Código": "small", "Descripción": "large",
+                    "Tipo": "small", "Obs.": "medium"})
         return
 
     fuente = obtener_fuente(item["fuente"])
