@@ -970,6 +970,230 @@ def _limpiar_numero(texto: str):
     except ValueError:
         return None
 
+# ---------------------------------------------------------------------------
+# REGIMENES ADUANEROS (Destinaciones de Importacion y Exportacion)
+# Tabla sin enlaces: N° | CÓD. | DESCRIPCIÓN | SUSPENSIVO-DEFINITIVO-TEMPORAL | OBS. |
+# IMPORT/EXPORT | CANCELA DDT.
+# ---------------------------------------------------------------------------
+COLUMNAS_REGIMENES = ["N°", "Código", "Descripción", "Tipo", "Obs.", "Import/Export", "Cancela DDT"]
+_RE_CODIGO_REGIMEN = re.compile(r"^[A-Z0-9]{3,5}$")
+
+
+def _puntaje_regimenes(df: pd.DataFrame) -> int:
+    """Filas con aspecto de regimen: columna Código con 4 caracteres alfanuméricos (EC01, IC04...)."""
+    if "Código" not in df.columns:
+        return 0
+    return int(df["Código"].astype(str).str.strip().str.match(_RE_CODIGO_REGIMEN).sum())
+
+
+def _regimenes_desde_tablas_html(html: str, url_base: str) -> pd.DataFrame:
+    """Respaldo: la <table> mas grande de la pagina, columnas renombradas por posicion."""
+    mejor = pd.DataFrame()
+    for _, df in extraer_tablas(html, url_base):
+        datos = [c for c in df.columns if c not in _COLS_ENLACE]
+        if len(datos) >= 3 and len(df) > len(mejor):
+            mejor = df[datos].copy()
+    if mejor.empty:
+        return mejor
+    n = min(len(mejor.columns), len(COLUMNAS_REGIMENES))
+    mejor = mejor.iloc[:, :n].copy()
+    mejor.columns = COLUMNAS_REGIMENES[:n]
+    for c in COLUMNAS_REGIMENES[n:]:
+        mejor[c] = ""
+    return mejor[COLUMNAS_REGIMENES]
+
+
+_RE_FILA_REGIMEN = re.compile(r"^(\d{1,3})\s+([A-Z0-9]{4})\s+(\S.*)$")
+_TIPOS_REGIMEN = ("Definitivo", "Suspensivo", "Temporal")
+_IMPEXP = ("Importacion", "Exportacion", "Importación", "Exportación")
+
+
+def _fila_regimen_desde_texto(texto: str):
+    """Separa una fila escrita como texto corrido ('1 DSEM DESCRIPCION Definitivo Simplificado
+    Exportacion No') en sus 7 columnas, leyendo las columnas de valores desde la derecha."""
+    m = _RE_FILA_REGIMEN.match(texto)
+    if not m:
+        return None
+    nro, cod, resto = m.groups()
+    fila = dict.fromkeys(COLUMNAS_REGIMENES, "")
+    fila["N°"], fila["Código"] = nro, cod
+    tokens = resto.split()
+
+    if len(tokens) >= 4 and tokens[-4:] == ["*"] * 4:           # "* * * *"
+        fila["Descripción"] = " ".join(tokens[:-4])
+        for c in ("Tipo", "Obs.", "Import/Export", "Cancela DDT"):
+            fila[c] = "*"
+        return fila
+
+    pos = resto.upper().find("NO APLICA")
+    if pos > 0:                                                  # celda combinada
+        fila["Descripción"] = resto[:pos].strip()
+        fila["Obs."] = resto[pos:].strip()
+        return fila
+
+    if tokens and tokens[-1] in ("Si", "No", "Sí"):
+        fila["Cancela DDT"] = tokens.pop()
+    if tokens and tokens[-1] in _IMPEXP:
+        fila["Import/Export"] = tokens.pop()
+    elif tokens and tokens[-1] == "*" and fila["Cancela DDT"]:
+        fila["Import/Export"] = tokens.pop()
+
+    idx = next((i for i, t in enumerate(tokens) if t in _TIPOS_REGIMEN), None)
+    if idx is None:
+        idx = next((i for i, t in enumerate(tokens) if t == "*"), None)
+    if idx is None:
+        fila["Descripción"] = " ".join(tokens)
+    else:
+        fila["Descripción"] = " ".join(tokens[:idx])
+        fila["Tipo"] = tokens[idx]
+        fila["Obs."] = " ".join(tokens[idx + 1:])
+    return fila
+
+
+def _regimenes_desde_texto(html: str) -> pd.DataFrame:
+    """Último respaldo: busca los elementos más internos cuyo texto completo tiene forma de fila
+    ('N° CÓDIGO DESCRIPCIÓN ...'), sin depender de <table> ni de celdas separadas."""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    candidatos = [t for t in soup.find_all(True)
+                  if _RE_FILA_REGIMEN.match(_texto(t)) and len(_texto(t)) < 400]
+    ids_con_hijo_valido = {id(p) for t in candidatos for p in t.parents}
+    filas = []
+    for t in candidatos:
+        if id(t) in ids_con_hijo_valido:
+            continue                                            # contenedor de varias filas
+        fila = _fila_regimen_desde_texto(_texto(t))
+        if fila:
+            filas.append(fila)
+    return pd.DataFrame(filas, columns=COLUMNAS_REGIMENES) if filas else pd.DataFrame()
+
+
+REGIMENES_RESPALDO = """
+1 DSEM DESPACHO SIMPLIFICADO DE EXPORTACIONES MENORES Definitivo Simplificado Exportacion No
+2 EC01 EXPORTACIÓN A CONSUMO Definitivo Normal Exportacion No
+3 EC04 EXPORTACIÓN A CONSUMO DE EXP. C/ RESERVA DE RETORNO Definitivo Reser. Ret Exportacion Si
+4 IC02 RE-IMPORT DE EXPORTACIÓN TEMPORAL. PERFECCIONA PASIVO Definitivo Exp. Temp. Importacion Si
+5 IC03 REGULARIZACIÓN LEY 608/95 Definitivo RUA Importacion No
+6 IC04 IMPORTACIÓN A CONSUMO CON DOCUMENTO DE TRANSPORTE Definitivo Normal Importacion No
+7 IC05 IMPORTACIÓN DIRECTO A CONSUMO C/ DOC. DE TRANSPORTE Definitivo Normal Importacion No
+8 IC13 RE IMPORTACION DE EXPORTACION DEFINITIVA RECHAZADA Definitivo * Importacion No
+9 IC06 IMPORTACION DEPOSITO ADUANERO * * * *
+10 IC07 IMPORTACIÓN A CONSUMO DE IMP.TEMPORAL S/ TRANSFORMACIÓN Definitivo A.T. Importacion Si
+11 IC08 IMPORTACIÓN A CONSUMO DE IMP. TEMPORAL C/ TRANSFORMACIÓN Definitivo A.T. Importacion Si
+12 AB01 APROVISIONAMIENTO A BORDO Definitivo Aprovisionamiento Exportacion Si
+13 DAAB DEPÓSITO DE APROVISIONAMIENTO ABORDO Suspensivo Aprovisionamiento Importacion No
+14 ECMA REEXPORTACION MONTADA * * * *
+15 IC01 RE-IMPORT DE EXPORTACIÓN TEMPORAL Definitivo Exp. Temp. Importacion Si
+16 IC09 IMPORTACIÓN A CONSUMO DESDE DEPOSITO ADUANERO Definitivo IDA Importacion Si
+17 IC12 NACIONALIZACIÓN MAQUILA / MAT PRIMA / INSUMO / DESPERDICIOS Definitivo Maquila Importacion Si
+18 IC19 NACIONALIZACIÓN DE DEPÓSITO DE OEC Definitivo OEA Importacion Si
+19 ICAB IMPORTACIÓN A CONSUMO DE APROVISIONAMIENTO A BORDO Definitivo Aprovisionamiento Importacion Si
+20 EC02 EXPORTACIÓN A CONSUMO C/DIT SIN TRANSFORMACIÓN Definitivo A.T. Exportacion Si
+21 EC03 EXPORTACIÓN A CONSUMO C/DIT CON TRANSFORMACIÓN Definitivo A.T. Exportacion Si
+22 ERMA REEXPORTACION AERONAVE * * * *
+23 ICMA NACIONALIZACION DE INGR. A DEP P/MANT. Y REPARAC. DE AERONAVES Definitivo Rep. y Mant. Aero Importacion Si
+24 ID04 IMPORTACIÓN DIPLOMÁTICA CON DOCUMENTO DE TRANSPORTE Definitivo Diplomatico Importacion No
+25 ID09 IMPORTACIÓN DIPLOMÁTICA DESDE DEPÓSITO ADUANERO Definitivo Diplomatico / IDA Importacion Si
+26 EVM1 EXPORTACIÓN MAQUILA VIRTUAL Definitivo Maquila Exportacion Si
+27 ICL1 NACIONALIZACIÓN LEASING Definitivo Leasing Importacion Si
+28 IM04 IMPORTACIÓN MENOR A CONSUMO CON DOCUMENTO DE TRANSPORTE Definitivo Normal Importacion No
+29 IT02 IMPORTACIÓN TEMPORARIA – MAQUILA CON TRANSFORMACIÓN. Suspensivo Maquila Importacion No
+30 IT03 IMPORTACIÓN TEMPORARIA – MAQUILA SIN TRANSFORMACIÓN. Suspensivo Maquila Importacion No
+31 IT04 IMPORTACIÓN TEMPORARIA S/TRANSFORMACIÓN C/DOC. TRANSPORT. Suspensivo A.T. Importacion No
+32 IT14 IMPORTACIÓN TEMPORARIA P/TRANSFORM.C/DOC.DE TRANSPORTE Suspensivo A.T. Importacion No
+33 EM01 EXPORTACIÓN MAQUILA Definitivo Maquila Exportacion Si
+34 ET01 EXPORTACIÓN TEMPORAL Temporal Exp. Temp. Exportacion Si
+35 ET02 EXPORTACIÓN TEMPORAL. PERFECCIONA PASIVO Temporal Exp. Temp. Exportacion Si
+36 IDMA INGR. A PEDOSITO P/MANT. Y REPARACION DE AERONAVES Suspensivo Rep. y Mant. Aero Importacion No
+37 IMAR IMPORTACION DE MATERIALES AERONAUTICOS REEMPLAZADOS Definitivo * Importacion No
+38 IT06 IMP.TEMP. MAQUILA S/TRANSFORM. SOBRE DEP.ALMAC Suspensivo .Maquila / IDA Importacion Si
+39 IT16 IMP.TEMP. MAQUILA C/TRANSFORM. SOBRE DEP.ALMAC. Suspensivo .Maquila / IDA Importacion Si
+40 IVM1 IMPORTACIÓN MAQUILA VIRTUAL SIN TRASFORMACIÓN Suspensivo Maquila Importacion Si
+41 SPA1 SUMINISTROS Y PROVISIONES AEREO Suspensivo Rep. y Mant. Aero Importacion No
+42 IML1 IMPORTACIÓN TEMPORARIA LEASING Suspensivo Leasing Importacion No
+43 IM05 IMPORTACIÓN MENOR S/ DOC DE TRANS. C/ CÓDIGO DE BARRAS Definitivo Normal Importacion No
+44 ECL1 EXPORTACIÓN DE CONSUMO LEASING Definitivo Leasing Exportacion Si
+45 ERR1 EXPORTACIÓN C/ RESERVA DE RETORNO Temporal Reser. Ret Exportacion No
+46 IM06 DESPACHO SIMPLIFICADO PARA IMPORTACIONES MENORES Definitivo Simplificado Importacion No
+47 ER04 EXPORT A CONSUMO DE EXP. C/ RESERVA RETORNO C/ TRANF. NO APLICA LA DESTINACION AL REGIMEN
+48 IC10 IMPORTACIÓN A CONSUMO DE EXP. C/ RESERVA DE RETORNO Definitivo Reser. Ret Importacion Si
+49 IR10 IMPORT A CONSUMO DE EXP. C/ RESERVA RETORNO C/ TRANF. NO APLICA LA DESTINACION AL REGIMEN
+50 ZF01 DECLARACIÓN DE INGRESO A ZONA FRANCA Suspensivo Zona Franca Importacion No
+51 IRE1 REMESA EXPRESA – DOCUMENTO Definitivo Courier Importacion No
+52 ZF2E EXPORTACIÓN DE ZONA FRANCA Definitivo Zona Franca Exportacion No
+53 ZF2M IMP TEMP DE ZONA FRANCA – MAQUILA CON TRANSFORMACIÓN. Suspensivo .Maquila / Zona Franca Importacion Si
+54 ZF3M IMP TEMP DE ZONA FRANCA – MAQUILA SIN TRANSFORMACIÓN. Suspensivo .Maquila / Zona Franca Importacion Si
+55 ZF2T IMP TEMPORAL DESDE ZONA FRANCA – CON TRANSFORMACIÓN. Suspensivo .A.T. / Zona Franca Importacion Si
+56 ZF3T IMP TEMPORAL DESDE ZONA FRANCA – SIN TRANSFORMACIÓN. Suspensivo .A.T. / Zona Franca Importacion Si
+57 IDA3 INGRESO A DEPOSITO ADUANERO C/ DOCUMENTO DE TRANSPORTE Suspensivo IDA Importacion No
+58 IRE2 REMESA EXPRESA – DE 0 A 100 USD Definitivo Courier Importacion No
+59 IRE3 REMESA EXPRESA – DE 100 A 1.000 USD Definitivo Courier Importacion No
+60 EC09 REEXPORTACIÓN DESDE DEPÓSITO ADUANERO Definitivo IDA Exportacion Si
+61 TDA3 TRASLADO ENTRE DEPÓSITOS ADUANEROS Suspensivo IDA * Si
+62 IRE4 REMESA EXPRESA – HASTA 1.000 USD Definitivo Courier Importacion No
+63 TDA5 TRASLADO DE DEPOSITO DE OEC Suspensivo .OEA / IDA * Si
+64 TLI3 INGRESO A CONSUMO DEFINITIVO Definitivo Duty Free Importacion Si
+65 TLI1 INGRESO A DEPOSITO DE TIENDA LIBRE Suspensivo Duty Free Importacion No
+66 TLI2 REEXPORTACION Definitivo Duty Free Exportacion Si
+67 TLI4 COMERCIALIZACION EN TIENDA LIBRE Definitivo Duty Free Exportacion Si
+68 ZF2I IMPORTACIÓN DE ZONA FRANCA Definitivo Importacion
+69 EC15 EXPORTACION A CONSUMO CON ENVASE Definitivo A.T. Exportacion Si
+71 IDA2 TRASLADO A DEPOSITO ADUANERO
+72 IFC1 IMPORTACION DE FRACCIONES COMPLEMENTARIAS * Fraccionado * Si
+74 IML2 IMPORTACION MANUAL MODALIDAD LEASING Suspensivo Leasing Importacion No
+75 IS01 IMPORTACION DE ASISTENCIA Y SALVAMENTO Definitivo Salvamento Importacion No
+76 ITL1 IMPORTACION TEMPORARIA DE LEASING * * * *
+77 MZF1 MOVIMIENTO DE ZONA FRANCA Suspensivo Zona Franca * Si
+78 NZF1 INGRESO A ZONA FRANCA MERCADERIAS NAC. NO APLICA LA DESTINACION AL REGIMEN
+79 XZF1 MOVIMIENTO DE ZONA FRANCA Suspensivo Zona Franca * Si
+"""
+
+
+def _regimenes_respaldo() -> pd.DataFrame:
+    """Copia de la tabla publicada por la DNIT; se usa solo si no se puede leer la página."""
+    filas = [_fila_regimen_desde_texto(l.strip()) for l in REGIMENES_RESPALDO.splitlines() if l.strip()]
+    df = pd.DataFrame([f for f in filas if f], columns=COLUMNAS_REGIMENES)
+    df["N°"] = df["N°"].astype(int)
+    return df
+
+
+def parser_regimenes(html: str, url_base: str = "https://www.dnit.gov.py",
+                     max_chars: int = None) -> pd.DataFrame:
+    """Tabla de Regímenes Aduaneros tal como la publica la DNIT (sin depender de enlaces)."""
+    df = _elegir_mejor([
+        lambda: extraer_tabla_por_encabezado(
+            html, ["N°", "CÓD.", "DESCRIPCIÓN", "SUSPENSIVO – DEFINITIVO – TEMPORAL",
+                   "OBS.", "IMPORT/EXPORT", "CANCELA DDT."],
+            COLUMNAS_REGIMENES, url_base),
+        lambda: _regimenes_desde_tablas_html(html, url_base),
+        lambda: extraer_tabla_por_ancla(
+            html, r"^\s*[A-Z]{2,4}\d{1,2}[A-Z]?\s*$",
+            {7: COLUMNAS_REGIMENES}, url_base, min_celdas=3, min_filas=10),
+        lambda: _regimenes_desde_texto(html),
+    ], _puntaje_regimenes, suficiente=20)
+    if df.empty or _puntaje_regimenes(df) < 10:
+        return _regimenes_respaldo()
+
+    df = df.drop(columns=[c for c in _COLS_ENLACE if c in df.columns]).copy()
+    for c in COLUMNAS_REGIMENES:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[COLUMNAS_REGIMENES].fillna("").astype(str).apply(lambda col: col.str.strip())
+    df = df[df["Código"].str.match(_RE_CODIGO_REGIMEN)]
+
+    # Filas con la celda combinada "NO APLICA LA DESTINACION AL REGIMEN": va a Obs.
+    for c in ("Tipo", "Obs.", "Import/Export", "Cancela DDT"):
+        nota = df[c].str.upper().str.startswith("NO APLICA")
+        df.loc[nota, "Obs."] = df.loc[nota, c]
+        for otra in ("Tipo", "Import/Export", "Cancela DDT"):
+            df.loc[nota, otra] = ""
+
+    if df["N°"].str.fullmatch(r"\d+").all():
+        df["N°"] = df["N°"].astype(int)
+    return df.drop_duplicates().reset_index(drop=True)
+
+
 URL_DIGESTO = "https://digestolegislativo.gov.py"
 _RE_ENCABEZADO = re.compile(r"^h[1-6]$")
 _RE_PROMULGACION = re.compile(r"Promulgaci[oó]n\W*([\d/\-]+)", re.IGNORECASE)
@@ -1241,10 +1465,10 @@ FUENTES = [
    {
         "id": "dnit_biblioteca_regimenes",
         "nombre": "DNIT - Biblioteca Regímenes",
-        "alias": ["regimen","regimenes"],
-        "url": "https://www.dnit.gov.py/web/portal-institucional/regímenes-aduaneros",
+        "alias": ["regimen","regimenes","regímenes","destinaciones","destinacion"],
+        "url": "https://www.dnit.gov.py/en/web/portal-institucional/reg%C3%ADmenes-aduaneros",
         "categoria": "aduanera",
-        "parser": parser_biblioteca_categoria,
+        "parser": parser_regimenes,
     },
    {
         "id": "dnit_biblioteca_oea",
@@ -1472,7 +1696,11 @@ def ejecutar_busqueda(termino: str, fuente_id: str = None):
     if not tokens:
         return fuente, df
 
-    df_str = df.astype(str).apply(lambda col: col.str.lower())
+    if "Título" in df.columns:
+        cols = [c for c in ("Título", "Descripción") if c in df.columns]
+    else:
+        cols = [c for c in df.columns if not str(c).startswith("Enlace")]
+    df_str = df[cols].astype(str).apply(lambda col: col.str.lower())    
     
     filtro = pd.Series([True] * len(df), index=df.index)
     for token in tokens:
