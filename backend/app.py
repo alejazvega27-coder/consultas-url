@@ -9,7 +9,6 @@ Estructura:
 """
 
 import difflib
-import pathlib
 import re
 import unicodedata
 import urllib.parse
@@ -34,22 +33,6 @@ from scraper import (
 
 LOGO_URL = "https://www.dnit.gov.py/documents/d/global/logo-light-svg-1?download=true"
 st.set_page_config(layout="wide", page_title="Buscador DNIT", page_icon=LOGO_URL)
-
-# ─── NUEVO: ruta del Manual de Usuario (PDF) que se sirve desde la propia app ───
-# Colocar el archivo "Manual_Usuario_Buscador_DNIT.pdf" en la misma carpeta que
-# este app.py (o en una subcarpeta "assets/").
-RUTA_MANUAL = pathlib.Path(__file__).parent / "Manual_Usuario_Buscador_DNIT.pdf"
-RUTA_MANUAL_ALT = pathlib.Path(__file__).parent / "assets" / "Manual_Usuario_Buscador_DNIT.pdf"
-
-
-@st.cache_data(show_spinner=False)
-def cargar_manual() -> bytes | None:
-    """Lee el PDF del manual desde el disco (caché en memoria). Devuelve None si no existe."""
-    for ruta in (RUTA_MANUAL, RUTA_MANUAL_ALT):
-        if ruta.exists():
-            return ruta.read_bytes()
-    return None
-
 
 # Sincronizar parámetros de URL para permitir clics directos en los iconos
 if "sec" in st.query_params and "seccion" not in st.session_state:
@@ -492,6 +475,7 @@ def mostrar_tabla_fuente(item: dict, filtro_base: str, clave: str, selects=(), t
             st.rerun()
         if item["fuente"] == "dnit_biblioteca_regimenes":
             mostrar_diagnostico(fuente["url"], clave, ("DSEM", "EC01"))
+        # mostrar_diagnostico(fuente["url"], clave, MUESTRAS_DIAGNOSTICO.get(item["fuente"], ()))
         return
 
     total = len(df)
@@ -562,6 +546,7 @@ def mostrar_tabla_fuente(item: dict, filtro_base: str, clave: str, selects=(), t
         st.dataframe(df, **opciones)
     st.download_button("⬇ Descargar CSV (filas filtradas)", df.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{item['fuente']}.csv", mime="text/csv", key=f"tf_csv_{clave}")
+    #mostrar_diagnostico(fuente["url"], clave, MUESTRAS_DIAGNOSTICO.get(item["fuente"], ()))
 
 
 MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
@@ -769,6 +754,7 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
         else:
             mostrar_tabla(df_instructivos, {"nombre": titulo_instructivos, "url": url_instructivos},
                           clave=f"tabla_{clave}_{item['fuente']}")
+        #st.link_button("🌐 Abrir fuente oficial de instructivos", url_instructivos, use_container_width=True)
         return
 
     if item["fuente"] == "dnit_biblioteca_mesa":
@@ -822,6 +808,7 @@ def mostrar_destino(seccion: str, tipo: str, item: dict, filtro_base: str = "",
                 st.info("No se pudieron detectar recursos individuales automáticamente. Consultá la página oficial.")
         except (requests.RequestException, ValueError) as error:
             st.warning(f"No se pudieron cargar los recursos automáticamente: {error}")
+        #mostrar_tablas_pagina(url_pvaa, f"pg_{clave}_pvaa")
         return
 
     if item["fuente"] == "dnit_cotizaciones":
@@ -956,8 +943,8 @@ ALIAS_TODOS = {
 }
 PALABRAS_RELLENO = {"de", "del", "la", "el", "los", "las", "en", "y", "dnit",
                     "legislativo", "norma", "normas", "normativa"}
-MIN_PREFIJO = 3
-MIN_TIPEO = 4
+MIN_PREFIJO = 3   
+MIN_TIPEO = 4     
 
 
 def reconocer(palabra: str):
@@ -969,7 +956,7 @@ def reconocer(palabra: str):
         if len(candidatos) == 1:
             return candidatos.pop()
         if len(candidatos) > 1:
-            return None
+            return None  
 
     if len(palabra) >= MIN_TIPEO:
         parecidos = difflib.get_close_matches(palabra, ALIAS_TODOS.keys(), n=1, cutoff=0.8)
@@ -1002,7 +989,7 @@ def destinos(secciones: list, tipos: list):
         if secciones and seccion not in secciones:
             continue
         if seccion == "Cotizaciones" and seccion not in secciones:
-            continue
+            continue  
         for tipo, item in datos["items"].items():
             if tipos and seccion != "Cotizaciones" and tipo not in tipos:
                 continue
@@ -1133,10 +1120,7 @@ st.markdown(
 
 URL_MARANGATU = "https://marangatu.set.gov.py/eset/login"
 
-# ─── NUEVO: 4 columnas (antes 3) para sumar el botón del Manual de Usuario ───
-col_buscador, col_limpiar, col_manual, col_marangatu = st.columns(
-    [4, 1, 1.4, 1.4], gap="medium"
-)
+col_buscador, col_limpiar, col_marangatu = st.columns([4, 1, 1.4], gap="medium")
 with col_buscador:
     termino = st.text_input(
         "Buscar",
@@ -1146,24 +1130,6 @@ with col_buscador:
     )
 with col_limpiar:
     st.button("✖ Limpiar", key="limpiar_general", on_click=limpiar_todo, width="stretch")
-
-# ─── NUEVO: botón de descarga del Manual de Usuario (con estilo oscuro) ───
-with col_manual:
-    contenido_manual = cargar_manual()
-    if contenido_manual is None:
-        st.warning("Manual no encontrado")
-    else:
-        # Envolvemos el download_button en un contenedor con key para estilizarlo.
-        with st.container(key="btn_manual_usuario_wrap"):
-            st.download_button(
-                label="📘 Manual de Usuario",
-                data=contenido_manual,
-                file_name="Manual_Usuario_Buscador_DNIT.pdf",
-                mime="application/pdf",
-                key="btn_manual_usuario",
-                use_container_width=True,
-            )
-
 with col_marangatu:
     st.markdown(
         f"""
@@ -1266,26 +1232,6 @@ else:
             type="primary" if activo_cot else "secondary",
         )
 
-        # ─── NUEVO: acceso al Manual de Usuario también desde el sidebar ───
-        st.markdown("---")
-        with st.expander("❓ Ayuda", expanded=False):
-            st.caption("Documentación de la aplicación · Versión 1.0 · Noviembre 2026")
-            contenido_manual_sb = cargar_manual()
-            if contenido_manual_sb is None:
-                st.info("El manual no está disponible en este momento.")
-            else:
-                st.download_button(
-                    "📘 Descargar Manual de Usuario (PDF)",
-                    data=contenido_manual_sb,
-                    file_name="Manual_Usuario_Buscador_DNIT.pdf",
-                    mime="application/pdf",
-                    key="btn_manual_sidebar",
-                    use_container_width=True,
-                )
-            st.markdown(
-                f"[🌐 Ir a Marangatu]({URL_MARANGATU})"
-            )
-
     # -----------------------------------------------------------------
     # BIBLIOTECA: se mantiene debajo del buscador general (en la
     # pantalla principal) para acceso directo, agrupada por sección.
@@ -1334,3 +1280,28 @@ else:
         scroll_a_resultados()
     else:
         st.info("Selecciona una opción del menú lateral (izquierda) para ver los resultados aquí.")
+
+
+URL_MANUAL_USUARIO = (
+    "https://cdn.jsdelivr.net/gh/alejazvega27-coder/consultas-url@main/"
+    "Manual_Usuario_Buscador_DNIT_ENTREGABLE.pdf"
+)
+
+st.markdown(
+    f"""
+    <a href="{URL_MANUAL_USUARIO}" target="_blank" rel="noopener" style="text-decoration:none;">
+        <div style="position:fixed; top:14px; right:20px; z-index:9999;
+                    background:#0b132b; border:1px solid #3b82f6; border-radius:8px;
+                    padding:7px 14px; display:flex; align-items:center; gap:8px;
+                    box-shadow:0 4px 10px rgba(0,0,0,0.35); transition:filter .2s ease;"
+             onmouseover="this.style.filter='brightness(1.3)'"
+             onmouseout="this.style.filter='brightness(1)'"
+             title="Abrir manual de usuario (PDF)">
+            <span style="color:#e7ebf3; font-size:0.85rem; font-weight:600; white-space:nowrap;">
+                Manual de Usuario
+            </span>
+        </div>
+    </a>
+    """,
+    unsafe_allow_html=True,
+)
