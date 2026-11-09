@@ -1290,7 +1290,7 @@ URL_MANUAL_USUARIO = (
 st.markdown(
     f"""
     <a href="{URL_MANUAL_USUARIO}" target="_blank" rel="noopener" style="text-decoration:none;">
-        <div style="position:fixed; top:14px; right:20px; z-index:9999;
+        <div style="position:fixed; top:14px; right:20px; z-index:2147483647;
                     background:#0b132b; border:1px solid #3b82f6; border-radius:8px;
                     padding:7px 14px; display:flex; align-items:center; gap:8px;
                     box-shadow:0 4px 10px rgba(0,0,0,0.35); transition:filter .2s ease;"
