@@ -1290,18 +1290,18 @@ URL_MANUAL_USUARIO = (
 st.markdown(
     f"""
     <a href="{URL_MANUAL_USUARIO}" target="_blank" rel="noopener" style="text-decoration:none;">
-        <div style="position:fixed; top:14px; right:20px; z-index:9999;
-                    background:#0b132b; border:1px solid #3b82f6; border-radius:8px;
+        <div style="position:fixed; top:14px; right:20px; z-index:2147483647;
+                    background:#0b132b; border:3px solid #ff0000; border-radius:8px;
                     padding:7px 14px; display:flex; align-items:center; gap:8px;
-                    box-shadow:0 4px 10px rgba(0,0,0,0.35); transition:filter .2s ease;"
-             onmouseover="this.style.filter='brightness(1.3)'"
-             onmouseout="this.style.filter='brightness(1)'"
-             title="Abrir manual de usuario (PDF)">
+                    box-shadow:0 4px 10px rgba(0,0,0,0.35);">
             <span style="color:#e7ebf3; font-size:0.85rem; font-weight:600; white-space:nowrap;">
                 Manual de Usuario
             </span>
         </div>
     </a>
+    """,
+    unsafe_allow_html=True,
+)
     """,
     unsafe_allow_html=True,
 )
