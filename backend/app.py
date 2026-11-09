@@ -1283,7 +1283,7 @@ else:
 
 
 URL_MANUAL_USUARIO = (
-    "https://cdn.jsdelivr.net/gh/alejazvega27-coder/consultas-url@main/"
+    "https://cdn.jsdelivr.net/gh/alejazvega27-coder/consultas-url@master/"
     "Manual_Usuario_Buscador_DNIT_ENTREGABLE.pdf"
 )
 
